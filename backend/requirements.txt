@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+sqlalchemy
+python-multipart
+pymupdf
+google-genai
+python-docx
+docxcompose
+python-dotenv
+pydantic
+pydantic-settings
+alembic

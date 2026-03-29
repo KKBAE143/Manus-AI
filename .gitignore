@@ -1,0 +1,19 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+__pycache__/
+*.py[cod]
+backend/venv/
+.env*
+!.env.example
+
+# Local agent and editor state
+.local/
+.claude/
+.agents/
+
+# Generated backend runtime data
+backend/storage/

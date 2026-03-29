@@ -1,0 +1,69 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "A user of the platform",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "email": { "type": "string", "format": "email" },
+        "displayName": { "type": "string" },
+        "role": { "type": "string", "enum": ["admin", "user"] },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email", "role", "createdAt"]
+    },
+    "Document": {
+      "title": "Document",
+      "description": "An uploaded PDF document",
+      "type": "object",
+      "properties": {
+        "ownerId": { "type": "string" },
+        "title": { "type": "string" },
+        "originalName": { "type": "string" },
+        "size": { "type": "number" },
+        "author": { "type": "string" },
+        "pages": { "type": "number" },
+        "status": { "type": "string", "enum": ["pending", "processing", "completed", "failed"] },
+        "progress": { "type": "number" },
+        "parts": { "type": "number" },
+        "fileUrl": { "type": "string" },
+        "config": { "type": "object" },
+        "chapters": { "type": "array" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerId", "title", "pages", "status", "createdAt"]
+    },
+    "Chapter": {
+      "title": "Chapter",
+      "description": "A detected chapter or part of a document",
+      "type": "object",
+      "properties": {
+        "documentId": { "type": "string" },
+        "ownerId": { "type": "string" },
+        "title": { "type": "string" },
+        "startPage": { "type": "number" },
+        "endPage": { "type": "number" },
+        "confidence": { "type": "number" },
+        "warning": { "type": "string" },
+        "status": { "type": "string", "enum": ["pending", "extracted", "converted"] }
+      },
+      "required": ["documentId", "ownerId", "title", "startPage", "endPage", "confidence", "status"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/User" },
+      "description": "User profiles"
+    },
+    "/documents/{documentId}": {
+      "schema": { "$ref": "#/entities/Document" },
+      "description": "Uploaded documents"
+    },
+    "/chapters/{chapterId}": {
+      "schema": { "$ref": "#/entities/Chapter" },
+      "description": "Detected chapters for documents"
+    }
+  }
+}

@@ -1,0 +1,191 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: users
+    // Document ID: {userId}
+    // Fields:
+    //   - uid: string (required, immutable) - User's Firebase UID
+    //   - email: string (required) - User's email address
+    //   - displayName: string (optional) - User's display name
+    //   - role: string (required) - 'admin' or 'user'
+    //   - createdAt: timestamp (required, immutable) - Creation time
+    //
+    // Collection: documents
+    // Document ID: {documentId}
+    // Fields:
+    //   - ownerId: string (required, immutable) - User ID of the owner
+    //   - title: string (required) - Document title
+    //   - originalName: string (optional) - Original file name
+    //   - size: number (optional) - File size
+    //   - author: string (optional) - Document author
+    //   - pages: number (required) - Total pages
+    //   - status: string (required) - 'pending', 'processing', 'completed', 'failed'
+    //   - progress: number (optional) - 0 to 100
+    //   - parts: number (optional) - Number of generated parts
+    //   - fileUrl: string (optional) - URL of the PDF
+    //   - config: map (optional) - Configuration settings
+    //   - chapters: list (optional) - Extracted chapters
+    //   - createdAt: timestamp (required, immutable) - Creation time
+    //   - updatedAt: timestamp (optional) - Last update time
+    //
+    // Collection: chapters
+    // Document ID: {chapterId}
+    // Fields:
+    //   - documentId: string (required, immutable) - ID of the parent document
+    //   - ownerId: string (required, immutable) - User ID of the owner
+    //   - title: string (required) - Chapter title
+    //   - startPage: number (required) - Start page number
+    //   - endPage: number (required) - End page number
+    //   - confidence: number (required) - 0 to 100
+    //   - warning: string (optional) - Warning message
+    //   - status: string (required) - 'pending', 'extracted', 'converted'
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    function isDocOwner() {
+      return isAuthenticated() && request.auth.uid == resource.data.ownerId;
+    }
+    
+    function uidUnchanged() {
+      return !('uid' in request.resource.data) || request.resource.data.uid == request.auth.uid;
+    }
+    
+    function uidNotModified() {
+      return !('uid' in request.resource.data) || request.resource.data.uid == resource.data.uid;
+    }
+    
+    function ownerIdUnchanged() {
+      return !('ownerId' in request.resource.data) || request.resource.data.ownerId == request.auth.uid;
+    }
+    
+    function ownerIdNotModified() {
+      return !('ownerId' in request.resource.data) || request.resource.data.ownerId == resource.data.ownerId;
+    }
+    
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+    
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+    
+    function isValidEmail(email) {
+      return email is string && email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
+    }
+    
+    function isAdmin() {
+      return isAuthenticated() && (
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin') ||
+        (request.auth.token.email == "dev.brainfog@gmail.com" && request.auth.token.email_verified == true)
+      );
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+    
+    function isValidUser(data) {
+      return hasOnlyAllowedFields(['uid', 'email', 'displayName', 'role', 'createdAt']) &&
+             data.uid is string && data.uid.size() > 0 && data.uid.size() < 128 &&
+             data.email is string && isValidEmail(data.email) && data.email.size() < 256 &&
+             (!('displayName' in data) || (data.displayName is string && data.displayName.size() < 100)) &&
+             data.role in ['admin', 'user'] &&
+             data.createdAt is timestamp;
+    }
+    
+    function isValidDocument(data) {
+      return hasOnlyAllowedFields(['ownerId', 'title', 'originalName', 'size', 'author', 'pages', 'status', 'progress', 'parts', 'fileUrl', 'config', 'chapters', 'createdAt', 'updatedAt']) &&
+             data.ownerId is string && data.ownerId.size() > 0 && data.ownerId.size() < 128 &&
+             data.title is string && data.title.size() > 0 && data.title.size() < 500 &&
+             (!('originalName' in data) || (data.originalName is string && data.originalName.size() < 500)) &&
+             (!('size' in data) || data.size is number) &&
+             (!('author' in data) || (data.author is string && data.author.size() < 256)) &&
+             data.pages is number && data.pages >= 0 &&
+             data.status in ['pending', 'processing', 'completed', 'failed'] &&
+             (!('progress' in data) || (data.progress is number && data.progress >= 0 && data.progress <= 100)) &&
+             (!('parts' in data) || (data.parts is number && data.parts >= 0)) &&
+             (!('fileUrl' in data) || (data.fileUrl is string && data.fileUrl.size() < 2048)) &&
+             (!('config' in data) || data.config is map) &&
+             (!('chapters' in data) || data.chapters is list) &&
+             data.createdAt is timestamp &&
+             (!('updatedAt' in data) || data.updatedAt is timestamp);
+    }
+    
+    function isValidChapter(data) {
+      return hasOnlyAllowedFields(['documentId', 'ownerId', 'title', 'startPage', 'endPage', 'confidence', 'warning', 'status']) &&
+             data.documentId is string && data.documentId.size() > 0 && data.documentId.size() < 128 &&
+             data.ownerId is string && data.ownerId.size() > 0 && data.ownerId.size() < 128 &&
+             data.title is string && data.title.size() > 0 && data.title.size() < 500 &&
+             data.startPage is number && data.startPage >= 0 &&
+             data.endPage is number && data.endPage >= data.startPage &&
+             data.confidence is number && data.confidence >= 0 && data.confidence <= 100 &&
+             (!('warning' in data) || (data.warning is string && data.warning.size() < 1000)) &&
+             data.status in ['pending', 'extracted', 'converted'];
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /users/{userId} {
+      allow read: if isOwner(userId) || isAdmin();
+      allow create: if isAuthenticated() && 
+                    isOwner(userId) && 
+                    isValidUser(request.resource.data) && 
+                    uidUnchanged() && 
+                    (request.resource.data.role == 'user' || isAdmin());
+      allow update: if isAuthenticated() && 
+                    isValidUser(request.resource.data) && 
+                    uidNotModified() && 
+                    request.resource.data.createdAt == resource.data.createdAt &&
+                    ((isOwner(userId) && request.resource.data.role == resource.data.role) || isAdmin());
+      allow delete: if isAdmin();
+    }
+
+    match /documents/{documentId} {
+      allow read: if isDocOwner() || isAdmin();
+      allow create: if isAuthenticated() && 
+                    ownerIdUnchanged() && 
+                    isValidDocument(request.resource.data);
+      allow update: if isAuthenticated() && 
+                    isValidDocument(request.resource.data) && 
+                    ownerIdNotModified() && 
+                    request.resource.data.createdAt == resource.data.createdAt &&
+                    (isDocOwner() || isAdmin());
+      allow delete: if isDocOwner() || isAdmin();
+    }
+    
+    match /chapters/{chapterId} {
+      allow read: if isDocOwner() || isAdmin();
+      allow create: if isAuthenticated() && 
+                    ownerIdUnchanged() && 
+                    isValidChapter(request.resource.data);
+      allow update: if isAuthenticated() && 
+                    isValidChapter(request.resource.data) && 
+                    ownerIdNotModified() && 
+                    request.resource.data.documentId == resource.data.documentId &&
+                    (isDocOwner() || isAdmin());
+      allow delete: if isDocOwner() || isAdmin();
+    }
+  }
+}

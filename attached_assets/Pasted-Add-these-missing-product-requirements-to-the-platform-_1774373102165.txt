@@ -1,0 +1,231 @@
+Add these missing product requirements to the platform design and implementation plan.
+
+NEW REQUIRED MODULES
+
+1. FINAL MANUSCRIPT GENERATION LAYER
+
+After chunk extraction and cleaning are complete, the system must support a manuscript assembly workflow.
+
+Required capabilities:
+- assemble cleaned chunk outputs into a structured manuscript draft
+- preserve exact content order
+- support chapter-aware assembly
+- include appendix/reference content separately
+- generate a final master DOCX
+- optionally generate a print-ready PDF
+- support multiple generation modes:
+  - raw merged manuscript
+  - structured manuscript
+  - publication-ready manuscript
+
+Generation modes:
+A. Raw Merge Mode
+- combines cleaned parts exactly as they are
+- only page breaks and file order normalization
+
+B. Structured Manuscript Mode
+- normalizes heading hierarchy
+- inserts front matter placeholders
+- separates appendix/back matter
+- generates TOC-ready heading structure
+
+C. Publication-Ready Mode
+- applies final book structure
+- front matter
+- chapter starts
+- appendix
+- back matter
+- page break logic
+- print/export readiness
+
+2. OPEN CANVAS MANUSCRIPT PREVIEW / EDITOR
+
+The platform must include a visual manuscript workspace where I can inspect the extracted/cleaned content before final manuscript generation.
+
+This must feel like an open canvas / book editor, not just a file list.
+
+Required capabilities:
+- preview each cleaned chunk or manuscript part
+- preview merged manuscript draft
+- book-like reading view
+- page-like view or continuous manuscript view
+- split-screen mode:
+  - left = source chunk / extracted part
+  - right = cleaned manuscript output
+- visual diff option if possible
+- editable content blocks
+- manual correction tools before final merge/export
+
+Editor requirements:
+- manual text correction
+- heading promotion/demotion
+- move section up/down
+- mark section as appendix/reference
+- insert page break
+- insert chapter break
+- merge/split paragraphs
+- fix broken headings
+- fix broken tables/lists manually
+- approve chunk as final
+- approve project for final merge
+
+The system must keep both:
+- original cleaned machine output
+- manually edited version
+
+This should be versioned, so the user can revert if needed.
+
+3. REAL BOOK PREVIEW MODE
+
+Add a “Book Preview” mode.
+
+This should simulate how the manuscript looks as a real book.
+
+View modes:
+- manuscript mode
+- page mode
+- print preview mode
+- chapter preview mode
+
+Book preview should support:
+- title page preview
+- chapter opening preview
+- headers/footers preview
+- margins/page size preview
+- page numbering preview
+- appendix preview
+- table of contents preview
+
+This is for visual QA before export.
+
+4. MANUAL QA / APPROVAL WORKFLOW
+
+The platform must support review checkpoints before final manuscript generation.
+
+Required workflow:
+- chunk processed
+- chunk reviewed
+- chunk approved
+- project assembled
+- manuscript reviewed
+- manuscript approved
+- final export generated
+
+At each stage the user should be able to:
+- flag issues
+- edit content
+- rerun specific pipeline stages
+- lock approved sections
+- unlock for revision if needed
+
+5. PUBLISHING TOOLS
+
+Add a publishing/prepress layer to the platform.
+
+Required publishing tools:
+- title page builder
+- copyright page builder
+- disclaimer page builder
+- dedication/preface/acknowledgements placeholders
+- table of contents generation
+- list of figures
+- list of tables
+- glossary placement
+- appendix manager
+- back matter manager
+
+Formatting/export tools:
+- chapter start on new page
+- heading hierarchy mapping
+- page numbering controls
+- page size options
+- margin presets
+- export DOCX
+- export PDF
+- print-ready PDF mode
+- optional EPUB-ready structure planning (future-ready)
+
+6. EDITOR DATA MODEL
+
+Add support for manuscript editing entities such as:
+- ManuscriptDraft
+- ManuscriptSection
+- SectionVersion
+- ReviewStatus
+- ApprovalStatus
+- UserEditAction
+- ChapterBoundary
+- AppendixSection
+- ExportProfile
+
+7. FRONTEND PAGES / COMPONENTS TO ADD
+
+Add these screens/components:
+
+A. Manuscript Workspace
+- central editor/canvas
+- section navigator
+- chapter navigator
+- left/right compare panel
+- save edits
+- approve section
+
+B. Book Preview Page
+- page preview
+- chapter preview
+- print preview
+
+C. Final Assembly Page
+- order manuscript parts
+- include/exclude appendix
+- build final manuscript
+
+D. Publishing Tools Page
+- title page fields
+- front matter builder
+- TOC generation
+- export controls
+
+E. Review Queue
+- chunks waiting for review
+- chunks with issues
+- approved chunks
+- manuscript approval status
+
+8. UX GOAL
+
+This should no longer feel like just a backend processor.
+It should feel like a manuscript production studio.
+
+The user journey should become:
+
+1. upload PDF
+2. process chunks
+3. inspect cleaned outputs
+4. edit/fix visually in canvas
+5. approve sections
+6. assemble manuscript
+7. preview as a real book
+8. generate final manuscript
+9. export publishing files
+
+9. IMPLEMENTATION RULES
+
+- preserve the existing strict-preservation manuscript pipeline
+- the new editor layer comes AFTER extraction/cleaning
+- do not replace the backend pipeline with a generative editor
+- manual edits must be explicit and versioned
+- the preview/editor is an editorial layer, not a rewriting layer
+
+10. NOW UPDATE THE IMPLEMENTATION PLAN
+
+Please update the architecture and implementation plan to include:
+- manuscript generation layer
+- visual canvas editor
+- review workflow
+- book preview mode
+- publishing tools
+
+Then propose the safest implementation order for these new capabilities.
+Do not code everything at once.
+Explain what should be built first after the core processing pipeline.
