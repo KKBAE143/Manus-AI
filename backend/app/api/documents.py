@@ -677,7 +677,7 @@ def download_merged_document(document_id: str, db: Session = Depends(get_db)):
     return FileResponse(
         path=str(merged_path),
         filename=merged_path.name,
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        media_type="application/pdf",
     )
 
 

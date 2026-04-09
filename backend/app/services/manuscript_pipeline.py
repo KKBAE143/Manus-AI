@@ -689,22 +689,25 @@ def merge_document_parts(document: Document, parts: list[ExportPart]) -> Path:
         raise ValueError("No parts available to merge")
 
     parts = sorted(parts, key=lambda item: item.part_number)
-    master = DocxDocument(parts[0].local_docx_path)
-    composer = Composer(master)
-    for part in parts[1:]:
-        composer.append(DocxDocument(part.local_docx_path))
-
-    appendix_path = get_appendix_path(document.id)
-    if appendix_path.exists():
-        composer.append(DocxDocument(str(appendix_path)))
 
     merge_dir = get_merge_dir(document.id)
-    merged_path = merge_dir / f"{Path(document.filename).stem}_merged.docx"
-    composer.save(str(merged_path))
+    master_typ_path = merge_dir / f"{Path(document.filename).stem}_master.typ"
+    merged_pdf_path = merge_dir / f"{Path(document.filename).stem}_final.pdf"
 
-    _post_process_merged_docx(str(merged_path))
+    with open(master_typ_path, "w", encoding="utf-8") as f:
+        f.write("#set page(margin: (x: 2.5cm, y: 2.5cm), numbering: \"1\")\n")
+        f.write("#set text(font: \"Linux Libertine\", size: 10pt, leading: 0.65em)\n")
+        f.write("#show heading: set block(above: 1.2em, below: 0.8em)\n\n")
 
-    return merged_path
+        for part in parts:
+            if Path(part.local_docx_path).exists():
+                # We reuse local_docx_path field in db for the typst path for now
+                part_path = str(Path(part.local_docx_path).absolute()).replace("\\", "/")
+                f.write(f'#include "{part_path}"\n\n')
+
+    import typst
+    typst.compile(str(master_typ_path), output=str(merged_pdf_path))
+    return merged_pdf_path
 
 
 def _build_front_matter_docx(profile, output_path: Path) -> None:
@@ -1108,28 +1111,31 @@ def extract_appendix_reference(document_id: str, db: Session) -> Optional[Path]:
     if not parts:
         return None
 
-    appendix_doc = DocxDocument()
+    appendix_path = get_merge_dir(document_id) / "appendix_reference.typ"
+
     in_appendix = False
     found_any = False
-    for part in parts:
-        if not Path(part.local_docx_path).exists():
-            continue
-        doc = DocxDocument(part.local_docx_path)
-        for para in doc.paragraphs:
-            text = para.text.strip()
-            if not text:
+
+    with open(appendix_path, "w", encoding="utf-8") as app_file:
+        for part in parts:
+            if not Path(part.local_docx_path).exists():
                 continue
-            if any(text.upper().startswith(heading) for heading in headings):
-                in_appendix = True
-            if in_appendix:
-                appendix_doc.add_paragraph(text)
-                found_any = True
+
+            with open(part.local_docx_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+                for line in lines:
+                    text = line.strip()
+                    if not text:
+                        continue
+                    if any(text.upper().startswith(heading) for heading in headings):
+                        in_appendix = True
+                        found_any = True
+                    if in_appendix:
+                        app_file.write(line)
 
     if not found_any:
         return None
 
-    appendix_path = get_appendix_path(document_id)
-    appendix_doc.save(str(appendix_path))
     return appendix_path
 
 
