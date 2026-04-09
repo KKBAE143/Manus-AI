@@ -48,6 +48,19 @@ from pdf_to_clean_docx import (  # noqa: E402
     write_manifest,
 )
 
+# New 3-stage pipeline imports
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")))
+try:
+    from extract_and_clean import clean_page_text as heuristic_clean
+    from semantic_tagger import CloudflarePool, call_cloudflare_ai
+    from build_typst_book import escape_typst, parse_table
+except ImportError:
+    heuristic_clean = clean_page_text
+    CloudflarePool = None
+    call_cloudflare_ai = None
+    escape_typst = None
+    parse_table = None
+
 
 _JOB_CONFIG_LOCK = threading.Lock()
 _JOB_CONFIG_CACHE: Dict[str, Dict[str, Any]] = {}
@@ -81,15 +94,10 @@ STAGES = [
     (1, "queued", "Queued"),
     (2, "inspect", "Inspecting PDF"),
     (3, "plan", "Planning Chunks"),
-    (4, "extract", "Extracting Pages"),
-    (5, "clean_pass_1", "Cleanup Pass 1"),
-    (6, "clean_pass_2", "Cleanup Pass 2"),
-    (7, "final_normalize", "Final Normalize"),
-    (8, "ai_transform", "AI Transformation"),
-    (9, "part_generate", "Generating DOCX Parts"),
-    (10, "appendix_extract", "Appendix Extraction"),
-    (11, "merge_prep", "Merge Preparation"),
-    (12, "completed", "Completed"),
+    (4, "extract", "Extracting & Cleaning"),
+    (5, "semantic_tagging", "Semantic Tagging"),
+    (6, "part_generate", "Generating Typst Manuscript"),
+    (7, "completed", "Completed"),
 ]
 
 
@@ -362,151 +370,117 @@ def run_pipeline(document_id: str, job_id: str, db: Session) -> Dict[str, Any]:
 
     total_to_process = max(1, end_page - start_page + 1)
 
-    for chunk in chunk_ranges:
-        chunk.status = ChunkStatus.processing
-        chunk.current_stage = "extract"
-        chunk.started_at = datetime.utcnow()
-        db.commit()
-        log_event(db, document_id, f"Processing chunk {chunk.chunk_index} ({chunk.page_start}-{chunk.page_end})", stage_key="extract", chunk_id=chunk.id)
-        extract_run = create_chunk_stage_run(db, chunk, "extract", "Extract Pages", message="Reading PDF pages")
+    pdf = fitz.open(document.local_storage_path)
+    try:
+        total_chunks = len(chunk_ranges)
+        for chunk in chunk_ranges:
+            chunk.status = ChunkStatus.processing
+            chunk.current_stage = "extract"
+            chunk.started_at = datetime.utcnow()
+            db.commit()
+            log_event(db, document_id, f"Processing chunk {chunk.chunk_index} ({chunk.page_start}-{chunk.page_end})", stage_key="extract", chunk_id=chunk.id)
+            extract_run = create_chunk_stage_run(db, chunk, "extract", "Extract & Clean", message="Extracting and cleaning PDF pages")
 
-        raw_lines = []
-        cleaned_pages = []
-        rich_pages = []
-        chunk_table_headers: set = set()
-        for source_page in range(chunk.page_start, chunk.page_end + 1):
-            page_obj = pdf[source_page - 1]
-            try:
-                items = extract_page_rich(page_obj)
-                plain = content_items_to_plain_text(items)
-                raw_text = plain if plain.strip() else page_obj.get_text("text")
-            except Exception:
-                items = []
-                plain = ""
+            cleaned_pages_data = []
+            for source_page in range(int(chunk.page_start), int(chunk.page_end) + 1):
+                page_obj = pdf[source_page - 1]
                 raw_text = page_obj.get_text("text")
-            raw_lines.append(f"===== PAGE {source_page} =====\n{raw_text}")
-            cleaned = clean_page_text(raw_text, seen_table_headers=chunk_table_headers)
-            keep = bool(plain.strip()) or bool(cleaned.strip())
-            page_records.append(PageRecord(source_page=source_page, cleaned_char_count=len(plain or cleaned), kept=keep))
-            if keep:
-                cleaned_pages.append((source_page, cleaned))
-                rich_pages.append((source_page, items))
+                cleaned = heuristic_clean(raw_text)
+                if cleaned.strip():
+                    cleaned_pages_data.append({
+                        "page_num": source_page,
+                        "text": cleaned
+                    })
+                page_records.append(PageRecord(source_page=source_page, cleaned_char_count=len(cleaned), kept=bool(cleaned.strip())))
 
-        raw_path = chunks_dir / f"chunk_{chunk.chunk_index:04d}_raw.txt"
-        raw_path.write_text("\n\n".join(raw_lines), encoding="utf-8")
-        chunk.raw_text_path = str(raw_path)
-        register_artifact(db, document_id, ArtifactType.chunk_text, f"Chunk {chunk.chunk_index} raw text", raw_path, chunk.id)
-        finish_chunk_stage_run(db, extract_run, status=ChunkStageStatus.completed, message="Raw extraction complete")
+            # Save as JSON chunk for stage 2
+            chunk_json_data = {
+                "chunk_index": int(chunk.chunk_index),
+                "pages": cleaned_pages_data
+            }
+            json_path = chunks_dir / f"chunk_{int(chunk.chunk_index):04d}.json"
+            json_path.write_text(json.dumps(chunk_json_data, ensure_ascii=False, indent=2), encoding="utf-8")
+            chunk.raw_text_path = str(json_path)
+            register_artifact(db, document_id, ArtifactType.chunk_text, f"Chunk {chunk.chunk_index} cleaned JSON", json_path, chunk.id)
+            finish_chunk_stage_run(db, extract_run, status=ChunkStageStatus.completed, message="Extraction & cleaning complete")
 
-        update_job(
-            db,
-            job,
-            stage=5,
-            stage_key="clean_pass_1",
-            stage_name="Cleanup Pass 1",
-            progress=15.0 + ((chunk.chunk_index - 1) / max(1, len(chunk_ranges))) * 60.0,
-            message=f"Cleanup pass 1 for chunk {chunk.chunk_index}/{len(chunk_ranges)}",
-        )
-        chunk.current_stage = "clean_pass_1"
+            update_job(db, job, stage=5, stage_key="semantic_tagging", stage_name="Semantic Tagging", progress=15.0 + ((int(chunk.chunk_index) - 1) / total_chunks) * 60.0, message=f"Semantic tagging for chunk {chunk.chunk_index}/{total_chunks}")
+            chunk.current_stage = "semantic_tagging"
+            db.commit()
+            tagging_run = create_chunk_stage_run(db, chunk, "semantic_tagging", "Semantic Tagging", message="Applying Cloudflare AI semantic tagging")
+
+            tagged_path = chunks_dir / f"tagged_chunk_{int(chunk.chunk_index):04d}.json"
+            if CloudflarePool:
+                try:
+                    pool = CloudflarePool()
+                    from semantic_tagger import process_file as tag_file
+                    tag_file(json_path, tagged_path, pool)
+                    register_artifact(db, document_id, ArtifactType.cleaned_text, f"Chunk {chunk.chunk_index} tagged JSON", tagged_path, chunk.id)
+                    finish_chunk_stage_run(db, tagging_run, status=ChunkStageStatus.completed, message="Semantic tagging complete")
+                except Exception as e:
+                    log_event(db, document_id, f"Tagging error: {e}", level="ERROR", stage_key="semantic_tagging", chunk_id=chunk.id)
+                    finish_chunk_stage_run(db, tagging_run, status=ChunkStageStatus.failed, message=f"Tagging failed: {e}")
+                    dummy_tagged = [{"tag": "body", "content": p["text"]} for p in cleaned_pages_data]
+                    tagged_path.write_text(json.dumps(dummy_tagged, ensure_ascii=False, indent=2), encoding="utf-8")
+            else:
+                dummy_tagged = [{"tag": "body", "content": p["text"]} for p in cleaned_pages_data]
+                tagged_path.write_text(json.dumps(dummy_tagged, ensure_ascii=False, indent=2), encoding="utf-8")
+                finish_chunk_stage_run(db, tagging_run, status=ChunkStageStatus.completed, message="Tagging skipped (dummy used)")
+
+            update_job(db, job, stage=6, stage_key="part_generate", stage_name="Generating Typst Manuscript", progress=25.0 + (int(chunk.chunk_index) / total_chunks) * 60.0, message=f"Generating Typst for chunk {chunk.chunk_index}/{total_chunks}")
+            chunk.current_stage = "part_generate"
+            db.commit()
+            part_run = create_chunk_stage_run(db, chunk, "part_generate", "Generate Typst Manuscript", message="Building Typst content")
+
+            typ_path = outputs_dir / f"chunk_{int(chunk.chunk_index):04d}.typ"
+            try:
+                with open(typ_path, 'w', encoding='utf-8') as f:
+                    with open(tagged_path, 'r', encoding='utf-8') as jf:
+                        tagged_content = json.load(jf)
+                    if not isinstance(tagged_content, list): tagged_content = [tagged_content]
+                    for item in tagged_content:
+                        tag = item.get("tag", item.get("type", "body"))
+                        content = item.get("content", "")
+                        if tag == "H1": f.write(f"= {escape_typst(content)}\n\n")
+                        elif tag == "H2": f.write(f"== {escape_typst(content)}\n\n")
+                        elif tag == "H3": f.write(f"=== {escape_typst(content)}\n\n")
+                        elif tag == "list": f.write(f"- {escape_typst(content)}\n")
+                        elif tag == "table": f.write(f"{parse_table(content)}\n\n")
+                        else: f.write(f"{escape_typst(content)}\n\n")
+
+                # Create dummy ExportPart for pipeline compatibility
+                export_part = ExportPart(
+                    document_id=document.id,
+                    job_id=job.id,
+                    part_number=int(chunk.chunk_index),
+                    page_start=int(chunk.page_start),
+                    page_end=int(chunk.page_end),
+                    page_count=int(chunk.page_count),
+                    local_docx_path=str(typ_path),
+                    filename=typ_path.name,
+                    status=PartStatus.generated,
+                )
+                db.add(export_part)
+                created_parts.append(export_part)
+                chunk.output_part_path = str(typ_path)
+                finish_chunk_stage_run(db, part_run, status=ChunkStageStatus.completed, message="Typst generation complete")
+            except Exception as e:
+                log_event(db, document_id, f"Typst generation error: {e}", level="ERROR", stage_key="part_generate", chunk_id=chunk.id)
+                finish_chunk_stage_run(db, part_run, status=ChunkStageStatus.failed, message=f"Typst generation failed: {e}")
+
+            chunk.progress_percent = 100.0
+            chunk.status = ChunkStatus.completed
+            chunk.current_stage = "completed"
+            chunk.finished_at = datetime.utcnow()
+            db.commit()
+            log_event(db, document_id, f"Chunk {chunk.chunk_index} completed", stage_key="part_generate", chunk_id=chunk.id)
+
+        flush_log_events(db)
+        pdf.close()
+
+        update_job(db, job, stage=7, stage_key="completed", stage_name="Completed", progress=100.0, message="Pipeline complete")
         db.commit()
-        clean1_run = create_chunk_stage_run(db, chunk, "clean_pass_1", "Cleanup Pass 1", message="Applying deterministic cleanup rules")
 
-        cleaned_text = "\n\n".join(f"===== PAGE {page} =====\n{text}" for page, text in cleaned_pages)
-        cleaned_path = chunks_dir / f"chunk_{chunk.chunk_index:04d}_cleaned.txt"
-        cleaned_path.write_text(cleaned_text, encoding="utf-8")
-        chunk.cleaned_text_path = str(cleaned_path)
-        register_artifact(db, document_id, ArtifactType.cleaned_text, f"Chunk {chunk.chunk_index} cleaned text", cleaned_path, chunk.id)
-
-        rich_data = [
-            {"page": page, "items": content_items_to_dict(items)}
-            for page, items in rich_pages
-        ]
-        rich_path = chunks_dir / f"chunk_{chunk.chunk_index:04d}_rich.json"
-        rich_path.write_text(json.dumps(rich_data, ensure_ascii=False, indent=2), encoding="utf-8")
-        register_artifact(db, document_id, ArtifactType.cleaned_text, f"Chunk {chunk.chunk_index} rich content JSON", rich_path, chunk.id)
-
-        finish_chunk_stage_run(db, clean1_run, status=ChunkStageStatus.completed, message="Chunk text cleaned")
-
-        chunk.current_stage = "clean_pass_2"
-        db.commit()
-        clean2_run = create_chunk_stage_run(db, chunk, "clean_pass_2", "Cleanup Pass 2", message="Second cleanup checkpoint")
-        finish_chunk_stage_run(db, clean2_run, status=ChunkStageStatus.completed, message="Second cleanup pass complete")
-
-        chunk.current_stage = "final_normalize"
-        db.commit()
-        normalize_run = create_chunk_stage_run(db, chunk, "final_normalize", "Final Normalize", message="Normalizing chunk output")
-        finish_chunk_stage_run(db, normalize_run, status=ChunkStageStatus.completed, message="Normalization complete")
-
-        update_job(
-            db,
-            job,
-            stage=8,
-            stage_key="part_generate",
-            stage_name="Generating DOCX Parts",
-            progress=25.0 + (chunk.chunk_index / max(1, len(chunk_ranges))) * 60.0,
-            message=f"Generating DOCX part for chunk {chunk.chunk_index}/{len(chunk_ranges)}",
-        )
-        chunk.current_stage = "part_generate"
-        db.commit()
-        part_run = create_chunk_stage_run(db, chunk, "part_generate", "Generate DOCX Part", message="Building DOCX for chunk")
-
-        export_part = _flush_part(
-            db,
-            document,
-            job,
-            outputs_dir,
-            rich_pages if rich_pages else cleaned_pages,
-            chunk.chunk_index,
-            config.keep_page_markers,
-        )
-        created_parts.append(export_part)
-        _assign_part_numbers(page_records, cleaned_pages, chunk.chunk_index)
-        chunk.output_part_path = export_part.local_docx_path
-        chunk.progress_percent = 100.0
-        chunk.status = ChunkStatus.completed
-        chunk.current_stage = "completed"
-        chunk.finished_at = datetime.utcnow()
-        db.commit()
-        finish_chunk_stage_run(db, part_run, status=ChunkStageStatus.completed, message="DOCX part generated")
-        log_event(db, document_id, f"Chunk {chunk.chunk_index} completed", stage_key="part_generate", chunk_id=chunk.id)
-
-    flush_log_events(db)
-    pdf.close()
-
-    update_job(db, job, stage=9, stage_key="appendix_extract", stage_name="Appendix Extraction", progress=92.0, message="Scanning parts for appendix/reference sections")
-    appendix_path = extract_appendix_reference(document_id, db)
-
-    update_job(db, job, stage=10, stage_key="merge_prep", stage_name="Merge Preparation", progress=93.0, message="Deduplicating content across chunks")
-    _dedup_cleaned_chunk_texts(document_id, db)
-
-    update_job(db, job, stage=10, stage_key="merge_prep", stage_name="Merge Preparation", progress=95.0, message="Writing manifest and indexing outputs")
-    manifest_path = manifests_dir / "manifest.json"
-    write_manifest(
-        records=page_records,
-        output_dir=manifests_dir,
-        input_pdf=document.filename,
-        start_page=start_page,
-        end_page=end_page,
-        pages_per_docx=config.pages_per_docx,
-    )
-    document.manifest_path = str(manifest_path)
-    register_artifact(db, document_id, ArtifactType.manifest, "Manifest JSON", manifest_path)
-    if appendix_path is not None:
-        register_artifact(db, document_id, ArtifactType.appendix, "Appendix Reference", appendix_path)
-
-    from app.services.manuscript_assembler import create_export_profile_defaults
-    create_export_profile_defaults(db, document, config)
-
-    document.status = DocumentStatus.merge_ready
-    document.error_log = None
-    job.status = JobStatus.completed
-    job.completed_at = datetime.utcnow()
-    flush_log_events(db)
-    log_path = logs_dir / f"job_{job.id}.log"
-    log_path.write_text("\n".join(event.message for event in db.query(ProjectEventLog).filter(ProjectEventLog.document_id == document_id).order_by(ProjectEventLog.created_at.asc()).all()), encoding="utf-8")
-    register_artifact(db, document_id, ArtifactType.log, "Pipeline log", log_path)
-    update_job(db, job, stage=11, stage_key="completed", stage_name="Completed", progress=100.0, message=f"Generated {len(created_parts)} DOCX parts", status=JobStatus.completed)
-    db.commit()
 
     return {
         "document_id": document_id,
@@ -1240,145 +1214,89 @@ def process_single_chunk(document_id: str, chunk_id: str, db: Session) -> Dict[s
         chunk.started_at = datetime.utcnow()
         db.commit()
         log_event(db, document_id, f"Processing chunk {chunk.chunk_index} ({chunk.page_start}-{chunk.page_end})", stage_key="extract", chunk_id=chunk.id)
-        extract_run = create_chunk_stage_run(db, chunk, "extract", "Extract Pages", message="Reading PDF pages")
+        extract_run = create_chunk_stage_run(db, chunk, "extract", "Extract & Clean", message="Extracting and cleaning PDF pages")
 
-        raw_lines = []
-        cleaned_pages = []
-        rich_pages: list = []
-        single_chunk_table_headers: set = set()
+        cleaned_pages_data = []
         for source_page in range(int(chunk.page_start), int(chunk.page_end) + 1):
             page_obj = pdf[source_page - 1]
-            try:
-                items = extract_page_rich(page_obj)
-                rich_plain = content_items_to_plain_text(items)
-                raw_text = rich_plain if rich_plain.strip() else page_obj.get_text("text")
-            except Exception:
-                items = []
-                raw_text = page_obj.get_text("text")
-            raw_lines.append(f"===== PAGE {source_page} =====\n{raw_text}")
-            cleaned = clean_page_text(raw_text, seen_table_headers=single_chunk_table_headers)
+            raw_text = page_obj.get_text("text")
+            cleaned = heuristic_clean(raw_text)
             if cleaned.strip():
-                cleaned_pages.append((source_page, cleaned))
-                rich_pages.append((source_page, items))
+                cleaned_pages_data.append({
+                    "page_num": source_page,
+                    "text": cleaned
+                })
 
-        raw_path = chunks_dir / f"chunk_{int(chunk.chunk_index):04d}_raw.txt"
-        raw_path.write_text("\n\n".join(raw_lines), encoding="utf-8")
-        chunk.raw_text_path = str(raw_path)
-        register_artifact(db, document_id, ArtifactType.chunk_text, f"Chunk {chunk.chunk_index} raw text", raw_path, chunk.id)
-        finish_chunk_stage_run(db, extract_run, status=ChunkStageStatus.completed, message="Raw extraction complete")
+        # Save as JSON chunk for stage 2
+        chunk_json_data = {
+            "chunk_index": int(chunk.chunk_index),
+            "pages": cleaned_pages_data
+        }
+        json_path = chunks_dir / f"chunk_{int(chunk.chunk_index):04d}.json"
+        json_path.write_text(json.dumps(chunk_json_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        chunk.raw_text_path = str(json_path) # Use this for now
+        register_artifact(db, document_id, ArtifactType.chunk_text, f"Chunk {chunk.chunk_index} cleaned JSON", json_path, chunk.id)
+        finish_chunk_stage_run(db, extract_run, status=ChunkStageStatus.completed, message="Extraction & cleaning complete")
 
-        update_job(db, job, stage=5, stage_key="clean_pass_1", stage_name="Cleanup Pass 1", progress=15.0 + ((int(chunk.chunk_index) - 1) / total_chunks) * 60.0, message=f"Cleanup pass 1 for chunk {chunk.chunk_index}/{total_chunks}")
-        chunk.current_stage = "clean_pass_1"
+        update_job(db, job, stage=5, stage_key="semantic_tagging", stage_name="Semantic Tagging", progress=15.0 + ((int(chunk.chunk_index) - 1) / total_chunks) * 60.0, message=f"Semantic tagging for chunk {chunk.chunk_index}/{total_chunks}")
+        chunk.current_stage = "semantic_tagging"
         db.commit()
-        clean1_run = create_chunk_stage_run(db, chunk, "clean_pass_1", "Cleanup Pass 1", message="Applying deterministic cleanup rules")
+        tagging_run = create_chunk_stage_run(db, chunk, "semantic_tagging", "Semantic Tagging", message="Applying Cloudflare AI semantic tagging")
 
-        cleaned_text = "\n\n".join(f"===== PAGE {page} =====\n{text}" for page, text in cleaned_pages)
-        cleaned_path = chunks_dir / f"chunk_{int(chunk.chunk_index):04d}_cleaned.txt"
-        cleaned_path.write_text(cleaned_text, encoding="utf-8")
-        chunk.cleaned_text_path = str(cleaned_path)
-        register_artifact(db, document_id, ArtifactType.cleaned_text, f"Chunk {chunk.chunk_index} cleaned text", cleaned_path, chunk.id)
-        finish_chunk_stage_run(db, clean1_run, status=ChunkStageStatus.completed, message="Chunk text cleaned")
+        tagged_path = chunks_dir / f"tagged_chunk_{int(chunk.chunk_index):04d}.json"
+        if CloudflarePool:
+            try:
+                pool = CloudflarePool()
+                # Local import or use the function directly
+                from semantic_tagger import process_file as tag_file
+                tag_file(json_path, tagged_path, pool)
+                register_artifact(db, document_id, ArtifactType.cleaned_text, f"Chunk {chunk.chunk_index} tagged JSON", tagged_path, chunk.id)
+                finish_chunk_stage_run(db, tagging_run, status=ChunkStageStatus.completed, message="Semantic tagging complete")
+            except Exception as e:
+                log_event(db, document_id, f"Tagging error: {e}", level="ERROR", stage_key="semantic_tagging", chunk_id=chunk.id)
+                finish_chunk_stage_run(db, tagging_run, status=ChunkStageStatus.failed, message=f"Tagging failed: {e}")
+                # Fallback: create a dummy tagged file with all body tags
+                dummy_tagged = [{"tag": "body", "content": p["text"]} for p in cleaned_pages_data]
+                tagged_path.write_text(json.dumps(dummy_tagged, ensure_ascii=False, indent=2), encoding="utf-8")
+        else:
+            # Fallback if tools not available
+            dummy_tagged = [{"tag": "body", "content": p["text"]} for p in cleaned_pages_data]
+            tagged_path.write_text(json.dumps(dummy_tagged, ensure_ascii=False, indent=2), encoding="utf-8")
+            finish_chunk_stage_run(db, tagging_run, status=ChunkStageStatus.completed, message="Tagging skipped (dummy used)")
 
-        chunk.current_stage = "clean_pass_2"
-        db.commit()
-        clean2_run = create_chunk_stage_run(db, chunk, "clean_pass_2", "Cleanup Pass 2", message="Second cleanup checkpoint")
-        finish_chunk_stage_run(db, clean2_run, status=ChunkStageStatus.completed, message="Second cleanup pass complete")
-
-        chunk.current_stage = "final_normalize"
-        db.commit()
-        normalize_run = create_chunk_stage_run(db, chunk, "final_normalize", "Final Normalize", message="Normalizing chunk output")
-        finish_chunk_stage_run(db, normalize_run, status=ChunkStageStatus.completed, message="Normalization complete")
-
-        update_job(db, job, stage=8, stage_key="ai_transform", stage_name="AI Transformation", progress=20.0 + (int(chunk.chunk_index) / total_chunks) * 40.0, message=f"AI transformation for chunk {chunk.chunk_index}/{total_chunks}")
-        chunk.current_stage = "ai_transform"
-        db.commit()
-        transform_run = create_chunk_stage_run(db, chunk, "ai_transform", "AI Transformation", message="Running two-pass AI content transformation")
-
-        transformed_blocks = None
-        try:
-            from app.core.ai_pool import get_ai_pool
-            from app.services.ai_transformer import (
-                build_transformed_text,
-                transform_chunk_text,
-            )
-            import dataclasses as _dc
-            import json as _json
-
-            ai_pool = get_ai_pool()
-            if ai_pool.available():
-                def _transform_progress(stage_label: str, pct: float) -> None:
-                    try:
-                        prog = 20.0 + (int(chunk.chunk_index) / total_chunks) * 40.0 + pct * 0.40
-                        update_job(db, job, stage=8, stage_key="ai_transform", stage_name="AI Transformation",
-                                   progress=min(prog, 60.0), message=f"[{stage_label}] chunk {chunk.chunk_index}")
-                    except Exception:
-                        pass
-
-                log_event(db, document_id, f"AI transform starting for chunk {chunk.chunk_index}", stage_key="ai_transform", chunk_id=chunk.id)
-                blocks, stats = transform_chunk_text(cleaned_text, ai_pool, progress_cb=_transform_progress)
-
-                if blocks:
-                    transformed_txt = build_transformed_text(blocks)
-                    transformed_path = chunks_dir / f"chunk_{int(chunk.chunk_index):04d}_transformed.txt"
-                    transformed_path.write_text(transformed_txt, encoding="utf-8")
-                    chunk.transformed_text_path = str(transformed_path)
-                    chunk.transformed_text = transformed_txt
-                    chunk.transform_stats = _dc.asdict(stats)
-
-                    transformed_json_path = chunks_dir / f"chunk_{int(chunk.chunk_index):04d}_transformed.json"
-                    transformed_json_path.write_text(
-                        _json.dumps([_dc.asdict(b) for b in blocks], ensure_ascii=False, indent=2),
-                        encoding="utf-8",
-                    )
-
-                    register_artifact(db, document_id, ArtifactType.transformed_text, f"Chunk {chunk.chunk_index} transformed text", transformed_path, chunk.id)
-                    register_artifact(db, document_id, ArtifactType.transformed_json, f"Chunk {chunk.chunk_index} transformed JSON", transformed_json_path, chunk.id)
-
-                    _annotate_blocks_with_spans(blocks, rich_pages)
-                    transformed_blocks = blocks
-                    log_event(db, document_id, f"AI transform done: {stats.total_blocks} blocks, {stats.rewritten_blocks} rewritten, {stats.fallback_blocks} fallbacks", stage_key="ai_transform", chunk_id=chunk.id)
-                else:
-                    log_event(db, document_id, "AI transform produced no blocks — using cleaned text for DOCX", stage_key="ai_transform", chunk_id=chunk.id)
-            else:
-                log_event(db, document_id, "No AI keys configured — skipping ai_transform stage", stage_key="ai_transform", chunk_id=chunk.id)
-        except Exception as ai_exc:
-            log_event(db, document_id, f"AI transform error (non-fatal): {ai_exc}", level="WARNING", stage_key="ai_transform", chunk_id=chunk.id)
-
-        finish_chunk_stage_run(db, transform_run, status=ChunkStageStatus.completed, message="AI transformation complete")
-
-        update_job(db, job, stage=9, stage_key="part_generate", stage_name="Generating DOCX Parts", progress=25.0 + (int(chunk.chunk_index) / total_chunks) * 60.0, message=f"Generating DOCX part for chunk {chunk.chunk_index}/{total_chunks}")
+        update_job(db, job, stage=6, stage_key="part_generate", stage_name="Generating Typst Manuscript", progress=25.0 + (int(chunk.chunk_index) / total_chunks) * 60.0, message=f"Generating Typst for chunk {chunk.chunk_index}/{total_chunks}")
         chunk.current_stage = "part_generate"
         db.commit()
-        part_run = create_chunk_stage_run(db, chunk, "part_generate", "Generate DOCX Part", message="Building DOCX for chunk")
+        part_run = create_chunk_stage_run(db, chunk, "part_generate", "Generate Typst Manuscript", message="Building Typst content")
 
-        export_part = db.query(ExportPart).filter(ExportPart.document_id == document_id, ExportPart.part_number == int(chunk.chunk_index)).first()
-        output_path = outputs_dir / f"textbook_part_{int(chunk.chunk_index):02d}.docx"
-        if transformed_blocks:
-            deduped_blocks = _dedup_blocks_before_render(transformed_blocks)
-            log_event(db, document_id, f"Dedup: {len(transformed_blocks)} -> {len(deduped_blocks)} blocks for chunk {chunk.chunk_index}", stage_key="part_generate", chunk_id=chunk.id)
-            build_docx_from_blocks(int(chunk.chunk_index), deduped_blocks, output_path)
-            log_event(db, document_id, f"DOCX part {chunk.chunk_index} built from {len(deduped_blocks)} AI-transformed blocks", stage_key="part_generate", chunk_id=chunk.id)
-        else:
-            build_docx_part(int(chunk.chunk_index), cleaned_pages, output_path, bool(config.keep_page_markers))
-        if export_part:
-            export_part.page_start = cleaned_pages[0][0] if cleaned_pages else int(chunk.page_start)
-            export_part.page_end = cleaned_pages[-1][0] if cleaned_pages else int(chunk.page_end)
-            export_part.page_count = len(cleaned_pages)
-            export_part.local_docx_path = str(output_path)
-            export_part.filename = output_path.name
-            export_part.status = PartStatus.generated
-        else:
-            db.add(ExportPart(document_id=document_id, job_id=job.id, part_number=int(chunk.chunk_index), page_start=cleaned_pages[0][0] if cleaned_pages else int(chunk.page_start), page_end=cleaned_pages[-1][0] if cleaned_pages else int(chunk.page_end), page_count=len(cleaned_pages), local_docx_path=str(output_path), filename=output_path.name, status=PartStatus.generated))
-        db.commit()
-        register_artifact(db, document_id, ArtifactType.docx_part, f"DOCX part {chunk.chunk_index}", output_path)
+        # We'll use build_typst_book's logic to generate a .typ fragment or similar
+        # For the pipeline compatibility, we might still want a DOCX or just mark the typ path
+        typ_path = outputs_dir / f"chunk_{int(chunk.chunk_index):04d}.typ"
 
-        chunk.output_part_path = str(output_path)
+        from build_typst_book import build_book as build_typst
+        # Note: build_typst expects a directory of tagged files, we can adapt or just write this chunk's content
+        # For now, let's write a simple .typ for this chunk
+        with open(typ_path, 'w', encoding='utf-8') as f:
+            with open(tagged_path, 'r', encoding='utf-8') as jf:
+                tagged_content = json.load(jf)
+            if not isinstance(tagged_content, list): tagged_content = [tagged_content]
+            for item in tagged_content:
+                tag = item.get("tag", item.get("type", "body"))
+                content = item.get("content", "")
+                if tag == "H1": f.write(f"= {escape_typst(content)}\n\n")
+                elif tag == "H2": f.write(f"== {escape_typst(content)}\n\n")
+                elif tag == "H3": f.write(f"=== {escape_typst(content)}\n\n")
+                elif tag == "list": f.write(f"- {escape_typst(content)}\n")
+                elif tag == "table": f.write(f"{parse_table(content)}\n\n")
+                else: f.write(f"{escape_typst(content)}\n\n")
+
+        chunk.output_part_path = str(typ_path)
         chunk.progress_percent = 100.0
         chunk.status = ChunkStatus.completed
         chunk.current_stage = "completed"
         chunk.finished_at = datetime.utcnow()
         db.commit()
-        finish_chunk_stage_run(db, part_run, status=ChunkStageStatus.completed, message="DOCX part generated")
+        finish_chunk_stage_run(db, part_run, status=ChunkStageStatus.completed, message="Typst generation complete")
         log_event(db, document_id, f"Chunk {chunk.chunk_index} completed", stage_key="part_generate", chunk_id=chunk.id, flush=True)
         return {"status": "success", "chunk_id": chunk.id}
     except Exception as exc:
@@ -1415,13 +1333,7 @@ def finalize_pipeline(document_id: str, job_id: str, db: Session) -> Dict[str, A
     manifests_dir = get_manifests_dir(document_id)
     logs_dir = get_logs_dir(document_id)
     try:
-        update_job(db, job, stage=10, stage_key="appendix_extract", stage_name="Appendix Extraction", progress=92.0, message="Scanning parts for appendix/reference sections")
-        appendix_path = extract_appendix_reference(document_id, db)
-
-        update_job(db, job, stage=11, stage_key="merge_prep", stage_name="Merge Preparation", progress=93.0, message="Deduplicating content across chunks")
-        _dedup_cleaned_chunk_texts(document_id, db)
-
-        update_job(db, job, stage=11, stage_key="merge_prep", stage_name="Merge Preparation", progress=95.0, message="Writing manifest and indexing outputs")
+        update_job(db, job, stage=7, stage_key="completed", stage_name="Completed", progress=100.0, message="Pipeline complete")
 
         pdf = fitz.open(document.local_storage_path)
         try:
@@ -1429,7 +1341,7 @@ def finalize_pipeline(document_id: str, job_id: str, db: Session) -> Dict[str, A
             end_page = min(len(pdf), int(config.end_page))
             records: list[PageRecord] = []
             for page_number in range(start_page, end_page + 1):
-                cleaned = clean_page_text(pdf[page_number - 1].get_text("text"))
+                cleaned = heuristic_clean(pdf[page_number - 1].get_text("text"))
                 part_number = None
                 for chunk in chunks:
                     if int(chunk.page_start) <= page_number <= int(chunk.page_end):
@@ -1444,8 +1356,6 @@ def finalize_pipeline(document_id: str, job_id: str, db: Session) -> Dict[str, A
         write_manifest(records=records, output_dir=manifests_dir, input_pdf=document.filename, start_page=max(1, int(config.start_page)), end_page=min(int(document.page_count or 0), int(config.end_page)), pages_per_docx=int(config.pages_per_docx))
         document.manifest_path = str(manifest_path)
         register_artifact(db, document_id, ArtifactType.manifest, "Manifest JSON", manifest_path)
-        if appendix_path is not None:
-            register_artifact(db, document_id, ArtifactType.appendix, "Appendix Reference", appendix_path)
 
         log_path = logs_dir / f"job_{job.id}.log"
         log_path.write_text("\n".join(event.message for event in db.query(ProjectEventLog).filter(ProjectEventLog.document_id == document_id).order_by(ProjectEventLog.created_at.asc()).all()), encoding="utf-8")
@@ -1455,8 +1365,7 @@ def finalize_pipeline(document_id: str, job_id: str, db: Session) -> Dict[str, A
         document.error_log = None
         job.status = JobStatus.completed
         job.completed_at = datetime.utcnow()
-        update_job(db, job, stage=12, stage_key="completed", stage_name="Completed", progress=100.0, message=f"Generated {len(chunks)} DOCX parts", status=JobStatus.completed)
-        log_event(db, document_id, "Pipeline finalized and ready for merge", stage_key="completed", flush=True)
+        log_event(db, document_id, "Pipeline finalized", stage_key="completed", flush=True)
         db.commit()
         return {"status": "success", "parts_generated": len(chunks), "manifest_path": str(manifest_path)}
     finally:
