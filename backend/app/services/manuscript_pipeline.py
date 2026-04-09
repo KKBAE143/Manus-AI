@@ -481,6 +481,9 @@ def run_pipeline(document_id: str, job_id: str, db: Session) -> Dict[str, Any]:
         update_job(db, job, stage=7, stage_key="completed", stage_name="Completed", progress=100.0, message="Pipeline complete")
         db.commit()
 
+    except Exception as e:
+        log_event(db, document_id, f"Pipeline error: {e}", level="ERROR")
+        raise e
 
     return {
         "document_id": document_id,
