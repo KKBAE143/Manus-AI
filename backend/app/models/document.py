@@ -61,8 +61,8 @@ class ArtifactType(str, enum.Enum):
     transformed_text = "TRANSFORMED_TEXT"
     transformed_json = "TRANSFORMED_JSON"
     manifest = "MANIFEST"
-    docx_part = "DOCX_PART"
-    merged_docx = "MERGED_DOCX"
+    typst_part = "TYPST_PART"
+    merged_pdf = "MERGED_PDF"
     appendix = "APPENDIX"
     log = "LOG"
 

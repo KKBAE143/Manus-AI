@@ -1291,6 +1291,7 @@ def process_single_chunk(document_id: str, chunk_id: str, db: Session) -> Dict[s
                 else: f.write(f"{escape_typst(content)}\n\n")
 
         chunk.output_part_path = str(typ_path)
+        register_artifact(db, document_id, ArtifactType.typst_part, f"Typst part {chunk.chunk_index}", typ_path, chunk.id)
         chunk.progress_percent = 100.0
         chunk.status = ChunkStatus.completed
         chunk.current_stage = "completed"

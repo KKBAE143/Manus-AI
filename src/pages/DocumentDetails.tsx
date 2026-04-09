@@ -67,7 +67,7 @@ const phaseMap = [
   { key: 'clean_pass_2',    label: 'Cleaning (Pass 2)',         friendly: 'Second round of text cleanup' },
   { key: 'final_normalize', label: 'Normalising',               friendly: 'Final formatting pass' },
   { key: 'ai_transform',    label: 'AI Enhancement',            friendly: 'AI is improving the text' },
-  { key: 'part_generate',   label: 'Creating Word files',       friendly: 'Generating DOCX parts' },
+  { key: 'part_generate',   label: 'Creating Typst files',       friendly: 'Generating Typst parts' },
   { key: 'appendix_extract',label: 'Appendix',                  friendly: 'Extracting appendix content' },
   { key: 'merge_prep',      label: 'Preparing merge',          friendly: 'Getting ready to combine parts' },
   { key: 'completed',       label: 'Done',                      friendly: 'Conversion complete!' },
@@ -339,7 +339,7 @@ export default function DocumentDetails() {
                   href={absoluteUrl(`/api/v1/documents/${document.id}/merged/download`)}
                   className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-[#1D2E24] text-white text-sm font-semibold hover:bg-[#2a3f32]"
                 >
-                  <Download size={14} /> Download DOCX
+                  <Download size={14} /> Download Typst
                 </a>
               )}
               <a
@@ -455,7 +455,7 @@ export default function DocumentDetails() {
           <div className="bg-white rounded-3xl p-6 shadow-sm flex flex-col">
             <div className="flex items-center justify-between mb-5">
               <div>
-                <h2 className="font-bold text-[#222] text-base">Generated Word Files</h2>
+                <h2 className="font-bold text-[#222] text-base">Generated Typst Files</h2>
                 <p className="text-xs text-[#888] mt-0.5">
                   {document.parts.length > 0
                     ? `${document.parts.length} file${document.parts.length !== 1 ? 's' : ''} ready to download`
@@ -478,7 +478,7 @@ export default function DocumentDetails() {
                   <FileText size={22} className="text-[#6A8776]" />
                 </div>
                 <p className="text-sm font-medium text-[#888]">
-                  {isActive ? 'Generating your Word files…' : 'No files generated yet'}
+                  {isActive ? 'Generating your Typst files…' : 'No files generated yet'}
                 </p>
                 {isActive && <Loader2 size={16} className="animate-spin text-[#6A8776] mt-3" />}
               </div>
