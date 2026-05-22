@@ -362,7 +362,109 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ content, edit_note: editNote }),
     }),
+  previewQuiz: async (quizFile: File, keyFile?: File | null) => {
+    const formData = new FormData();
+    formData.append('quiz_file', quizFile);
+    if (keyFile) formData.append('key_file', keyFile);
+    let response: Response;
+    try {
+      response = await fetch(`${API_BASE}/api/v1/quiz/preview`, {
+        method: 'POST',
+        body: formData,
+      });
+    } catch (error) {
+      if (error instanceof TypeError) {
+        throw new ApiError(`Unable to reach API at ${API_BASE}.`, { backendUnavailable: true });
+      }
+      throw error;
+    }
+    if (!response.ok) {
+      throw new ApiError(await response.text(), { status: response.status });
+    }
+    return response.json() as Promise<QuizPreview>;
+  },
+  confirmQuiz: (jobId: string, opts?: { subjectCode?: string | null; proceedWithoutKey?: boolean }) =>
+    request<QuizResult>(`/api/v1/quiz/confirm`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        job_id: jobId,
+        subject_code: opts?.subjectCode ?? null,
+        proceed_without_key: opts?.proceedWithoutKey ?? false,
+      }),
+    }),
+  listQuizLibrary: () => request<{ items: QuizResult[]; count: number }>(`/api/v1/quiz/library`),
+  deleteQuizResult: (id: string) =>
+    request<{ status: string; id: string }>(`/api/v1/quiz/${id}`, { method: 'DELETE' }),
+  bulkDownloadQuiz: async (ids?: string[]) => {
+    let response: Response;
+    try {
+      response = await fetch(`${API_BASE}/api/v1/quiz/library/bulk-download`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: ids ?? null }),
+      });
+    } catch (error) {
+      if (error instanceof TypeError) {
+        throw new ApiError(`Unable to reach API at ${API_BASE}.`, { backendUnavailable: true });
+      }
+      throw error;
+    }
+    if (!response.ok) {
+      throw new ApiError(await response.text(), { status: response.status });
+    }
+    const blob = await response.blob();
+    const cd = response.headers.get('Content-Disposition') || '';
+    const m = cd.match(/filename="?([^";]+)"?/i);
+    const filename = m ? m[1] : `quiz_library_${Date.now()}.zip`;
+    return { blob, filename };
+  },
 };
+
+export interface QuizPreview {
+  job_id: string;
+  quiz_filename: string;
+  key_filename: string | null;
+  quiz_stats: {
+    source_pages: number;
+    questions_kept: number;
+    translations_removed: number;
+    sections_detected: number;
+  };
+  answer_key: null | {
+    matched_subject: { code: string; name: string; total_entries: number } | null;
+    subject_match_counts: Record<string, number>;
+    matched_count: number;
+    missing_ids: string[];
+    extra_ids_in_key?: string[];
+    extra_ids_count?: number;
+    warnings: string[];
+    subjects_in_key: Array<{ code: string; name: string }>;
+    answer_kinds_breakdown?: Record<string, number>;
+    preview_examples?: Array<{ q_id: string; raw: string; text: string; kind: string }>;
+  };
+}
+
+export interface QuizResult {
+  id: string;
+  created_at: string;
+  input_filename: string;
+  key_filename: string | null;
+  output_filename: string;
+  answers_attached: boolean;
+  answer_subject?: string | null;
+  size_bytes?: number;
+  download_url?: string;
+  stats: {
+    source_pages: number;
+    questions_kept: number;
+    translations_removed: number;
+    sections_detected: number;
+    answers_matched: number;
+    answers_missing_count: number;
+    answers_missing?: Array<{ q_num: number; q_id: string }>;
+  };
+}
 
 export function absoluteUrl(path: string): string {
   if (/^https?:\/\//.test(path)) return path;

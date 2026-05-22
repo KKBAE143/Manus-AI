@@ -22,6 +22,7 @@ const BookPreview = lazy(() => import('./pages/BookPreview'));
 const FinalAssembly = lazy(() => import('./pages/FinalAssembly'));
 const PublishingTools = lazy(() => import('./pages/PublishingTools'));
 const DocumentSelectorPage = lazy(() => import('./pages/DocumentSelectorPage'));
+const QuizCleaner = lazy(() => import('./pages/QuizCleaner'));
 
 function RouteFallback() {
   return (
@@ -131,6 +132,7 @@ export default function App() {
                   } />
                   <Route path="/publishing" element={<DocumentSelectorPage destination="publishing" />} />
                   <Route path="/publishing/:id" element={<PublishingTools />} />
+                  <Route path="/quiz-cleaner" element={<QuizCleaner />} />
                   <Route path="*" element={<Navigate to="/" replace />} />
                 </Routes>
               </Suspense>

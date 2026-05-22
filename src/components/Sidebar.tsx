@@ -11,6 +11,7 @@ import {
   ClipboardCheck,
   Library,
   Wrench,
+  FileQuestion,
 } from 'lucide-react';
 
 export default function Sidebar() {
@@ -31,6 +32,8 @@ export default function Sidebar() {
   const onPublishingDoc = useMatch('/publishing/:id');
   const onPublishing = onPublishingBase || onPublishingDoc;
 
+  const onQuizCleaner = useMatch('/quiz-cleaner');
+
   const navItems = [
     { icon: LayoutGrid, path: '/', label: 'Dashboard', end: true },
     { icon: FileUp, path: '/upload', label: 'Upload', end: true },
@@ -42,6 +45,7 @@ export default function Sidebar() {
     { icon: BookOpen, label: 'Workspace', active: !!onWorkspace, onClick: () => navigate('/workspace') },
     { icon: Library, label: 'Assembly', active: !!onAssembly, onClick: () => navigate('/assembly') },
     { icon: Wrench, label: 'Publishing', active: !!onPublishing, onClick: () => navigate('/publishing') },
+    { icon: FileQuestion, label: 'Quiz Cleaner', active: !!onQuizCleaner, onClick: () => navigate('/quiz-cleaner') },
   ];
 
   const initials = user?.displayName

@@ -3,7 +3,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 
 from app.api.documents import router as documents_router
+from app.api.test import router as test_router
 from app.api.manuscript import router as manuscript_router
+from app.api.quiz import router as quiz_router
 from app.core.config import settings
 from app.core.database import Base, engine
 from sqlalchemy import text
@@ -72,6 +74,34 @@ def _run_migrations():
 
 _run_migrations()
 
+
+def _cleanup_stale_jobs():
+    """Reset any PROCESSING/QUEUED documents and IN_PROGRESS jobs left over from a previous crash."""
+    try:
+        with engine.connect() as conn:
+            conn.execute(text(
+                "UPDATE documents SET status = 'FAILED', error_log = 'Server restarted while processing' "
+                "WHERE status IN ('PROCESSING', 'QUEUED')"
+            ))
+            conn.execute(text(
+                "UPDATE jobs SET status = 'FAILED', error_log = 'Server restarted while processing' "
+                "WHERE status IN ('PENDING', 'IN_PROGRESS')"
+            ))
+            conn.execute(text(
+                "UPDATE chunks SET status = 'FAILED', error_log = 'Server restarted while processing' "
+                "WHERE status IN ('PROCESSING', 'QUEUED')"
+            ))
+            conn.execute(text(
+                "UPDATE merge_jobs SET status = 'FAILED', error_log = 'Server restarted while processing' "
+                "WHERE status IN ('PENDING', 'IN_PROGRESS')"
+            ))
+            conn.commit()
+    except Exception:
+        pass
+
+
+_cleanup_stale_jobs()
+
 app = FastAPI(title=settings.PROJECT_NAME, version="2.0.0")
 
 app.add_middleware(GZipMiddleware, minimum_size=1024)
@@ -84,7 +114,9 @@ app.add_middleware(
 )
 
 app.include_router(documents_router)
+app.include_router(test_router)
 app.include_router(manuscript_router)
+app.include_router(quiz_router)
 
 
 @app.get("/")
