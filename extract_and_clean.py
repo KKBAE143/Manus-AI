@@ -131,6 +131,77 @@ HARD_REMOVE_PATTERNS = [
     r"^\s*and structure intact\.\s*$",
     r"^\s*digital release\.\s*$",
     r'^\s*Health Through Food Wisdom\."\s*$',
+    # --- User responses ---
+    r"^\s*A BIG YESS?\s*!*\s*$",
+    r"^\s*Go ahead[!.]*\s*$",
+    r"^\s*Continue[!.]*\s*$",
+    r"^\s*Do it[!.]*\s*$",
+    r"^\s*Proceed[!.]*\s*$",
+    r"^\s*Sounds good[!.]*\s*$",
+    r"^\s*That'?s? great[!.]*\s*$",
+    r"^\s*Love it[!.]*\s*$",
+    r"^\s*Spot on[!.]*\s*$",
+    r"^\s*Let'?s do it[!.]*\s*$",
+    r"^\s*That works[!.]*\s*$",
+    r"^\s*Looks good[!.]*\s*$",
+    r"^\s*I like (?:this|that|it)[!.]*\s*$",
+    r"^\s*You got it[!.]*\s*$",
+    r"^\s*Exactly[!.]*\s*$",
+    r"^\s*Right[!.]*\s*$",
+    r"^\s*OK[!.]*\s*$",
+    r"^\s*Okay[!.]*\s*$",
+    r"^\s*Fine[!.]*\s*$",
+    r"^\s*Go for it[!.]*\s*$",
+    r"^\s*Make it happen[!.]*\s*$",
+    r"^\s*That'?s? perfect[!.]*\s*$",
+    r"^\s*Nice[!.]*\s*$",
+    r"^\s*Cool[!.]*\s*$",
+    r"^\s*Got it[!.]*\s*$",
+    r"^\s*Understood[!.]*\s*$",
+    # --- ChatGPT planning/meta ---
+    r"^\s*Here'?s how I'?ll structure.*$",
+    r"^\s*The flow will be.*$",
+    r"^\s*I'?ll organize this as.*$",
+    r"^\s*My approach:?\s*$",
+    r"^\s*Structure overview:?\s*$",
+    r"^\s*Here'?s the structure.*$",
+    r"^\s*Here'?s the outline.*$",
+    r"^\s*Here'?s the format.*$",
+    r"^\s*The format will be.*$",
+    r"^\s*Here'?s the layout.*$",
+    # --- Design discussions ---
+    r"^\s*Which layout do you prefer.*$",
+    r"^\s*Option [A-Z] vs Option [A-Z].*$",
+    r"^\s*Here are two approaches.*$",
+    r"^\s*Do you want columns or.*$",
+    r"^\s*Font suggestion:.*$",
+    r"^\s*Which style do you prefer.*$",
+    r"^\s*Layout (?:option|choice|preference).*$",
+    # --- Meta-commentary ---
+    r"^\s*This is coming along great.*$",
+    r"^\s*Almost done with this section.*$",
+    r"^\s*Just one more part.*$",
+    r"^\s*That wraps up.*$",
+    r"^\s*On to the next.*$",
+    r"^\s*Final polishing.*$",
+    r"^\s*Ready to export.*$",
+    r"^\s*This completes the.*$",
+    r"^\s*We'?re all set.*$",
+    r"^\s*That'?s everything for.*$",
+    r"^\s*Next up:?\s*$",
+    r"^\s*Up next:?\s*$",
+    r"^\s*Coming up next.*$",
+    # --- File generation ---
+    r"^\s*Generating Word file.*$",
+    r"^\s*Creating PDF.*$",
+    r"^\s*Compiling document.*$",
+    r"^\s*Formatting complete.*$",
+    r"^\s*File ready for download.*$",
+    r"^\s*Document generated.*$",
+    r"^\s*Export complete.*$",
+    r"^\s*Here'?s your (?:file|document|PDF|Word).*$",
+    r"^\s*The (?:file|document|PDF) is ready.*$",
+    r"^\s*Download ready.*$",
 ]
 
 SOFT_REMOVE_CONTAINS = [
@@ -242,6 +313,17 @@ NUMBER_EMOJI_RE = re.compile("|".join(re.escape(k) for k in NUMBER_EMOJI_MAP))
 TEXT_FUSION_RE = re.compile(r"([a-z])([A-Z])")
 DIGIT_LETTER_RE = re.compile(r"(\d)([A-Za-z])")
 LETTER_DIGIT_RE = re.compile(r"([a-z])(\d)")
+PERIOD_UPPER_RE = re.compile(r"([.)])([A-Z])")
+
+# Medical/scientific compound words that should NOT be split by text fusion
+FUSION_GUARD_WORDS = {
+    "pH", "mL", "dL", "kCal", "kcal", "mmHg", "mg", "mcg", "IU",
+    "BMI", "GFR", "eGFR", "HbA1c", "LDL", "HDL", "VLDL", "TGs",
+    "kDa", "mEq", "mmol", "umol", "ng", "pg", "ug", "mM", "uM",
+    "nM", "kJ", "MJ", "RDA", "UL", "AI", "DRI", "AMDR",
+    "CRP", "TNF", "IL", "NF", "mRNA", "DNA", "RNA", "ATP", "ADP",
+    "CoA", "CoQ", "NAD", "NADH", "FAD", "FADH",
+}
 
 PIPE_TABLE_RE = re.compile(r"^\s*\|.+\|.+\|\s*$")
 
@@ -281,6 +363,25 @@ CHAT_DROP_PATTERNS = [
     re.compile(r"\bdiet modification master manual\b", re.I),
     re.compile(r"\bnavath\s*kaladhar\b", re.I),
     re.compile(r"\bnavathkaladhar\b", re.I),
+    # --- Broad conversational catch-all patterns ---
+    re.compile(r"\bhere'?s (how|what|the plan|the structure|the outline|the format|the layout|your|my|our)\b", re.I),
+    re.compile(r"\bi'?ll (now |)(start|begin|create|generate|build|write|format|compile|structure|organize|prepare|draft|design)\b", re.I),
+    re.compile(r"\b(ready to|shall we|want me to|should i|do you want me to)\b", re.I),
+    re.compile(r"^\s*(great|perfect|excellent|awesome|wonderful|amazing|fantastic)[!.]?\s*(choice|question|idea|point)?\s*[!.]?\s*$", re.I),
+    re.compile(r"\b(buddy|friend)\s*,?\s*(here|this|we|let|i)\b", re.I),
+    re.compile(r"\bdt\.\s*,?\s*(here|this|we|let|i)\b", re.I),
+    re.compile(r"\bi'?ve (now |)(completed|finished|created|generated|built|compiled|formatted|structured|drafted)\b", re.I),
+    re.compile(r"\bthis (section|chapter|module|part|unit) (is|was) (now|finally|officially)\b", re.I),
+    re.compile(r"\blet me know (if|when|what|how|whether)\b", re.I),
+    re.compile(r"\bwhat do you think\??\s*$", re.I),
+    re.compile(r"\bhow does (this|that) (look|sound)\??\s*$", re.I),
+    re.compile(r"\bshall i (proceed|continue|go ahead|move on|start)\b", re.I),
+    re.compile(r"\bonce you (confirm|approve|reply|respond)\b", re.I),
+    re.compile(r"\bjust (confirm|tell me|let me know)\b", re.I),
+    re.compile(r"\bbefore i (proceed|continue|start|begin|generate|create)\b", re.I),
+    re.compile(r"\bready for (the next|your|final|publishing|export)\b", re.I),
+    re.compile(r"\bon to (the next|module|section|chapter|part)\b", re.I),
+    re.compile(r"\bthat (wraps|covers|concludes|completes|finishes) (up |)(this|the|our)\b", re.I),
 ]
 
 LIST_ITEM_RE = re.compile(

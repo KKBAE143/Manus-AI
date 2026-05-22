@@ -243,7 +243,7 @@ export default function Dashboard() {
   };
 
   const handleActionClick = () => {
-    if (jobDone && activeJob) { navigate(`/documents/${activeJob.docId}`); return; }
+    if (jobDone && activeJob) { navigate(`/assembly/${activeJob.docId}`); return; }
     if (canStart) handleStartProcessing();
   };
 
@@ -252,7 +252,7 @@ export default function Dashboard() {
     <main className="flex-1 flex flex-col h-full overflow-hidden">
       <Header
         title={`Hello, ${user?.displayName?.split(' ')[0] || 'there'}!`}
-        subtitle="Ready to convert your manuscript PDF into a publication-quality DOCX."
+        subtitle="Ready to convert your manuscript PDF into a publication-quality book."
       />
 
       <div className="flex-1 overflow-y-auto pb-6 px-6 md:px-0 md:pr-2 flex flex-col">

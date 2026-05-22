@@ -509,27 +509,39 @@ def preview_part(part_id: str, db: Session = Depends(get_db), q: str | None = Qu
         raise HTTPException(status_code=404, detail="Part not found.")
     if not os.path.exists(part.local_docx_path):
         raise HTTPException(status_code=404, detail="Part file missing.")
-    from docx import Document as DocxDocument
 
-    doc = DocxDocument(part.local_docx_path)
-    from docx.oxml.table import CT_Tbl
-    from docx.oxml.text.paragraph import CT_P
-    from docx.table import Table
-    from docx.text.paragraph import Paragraph as DocxParagraph
-
+    file_ext = os.path.splitext(part.local_docx_path)[1].lower()
     lines: list[str] = []
-    for child in doc.element.body.iterchildren():
-        if isinstance(child, CT_P):
-            para = DocxParagraph(child, doc)
-            text = para.text.strip()
-            if text:
-                lines.append(text)
-        elif isinstance(child, CT_Tbl):
-            tbl = Table(child, doc)
-            for row in tbl.rows:
-                row_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
-                if row_text:
-                    lines.append(row_text)
+
+    if file_ext == ".typ":
+        with open(part.local_docx_path, "r", encoding="utf-8") as f:
+            for line in f:
+                text = line.strip()
+                if text:
+                    lines.append(text)
+    else:
+        try:
+            from docx import Document as DocxDocument
+            doc = DocxDocument(part.local_docx_path)
+            from docx.oxml.table import CT_Tbl
+            from docx.oxml.text.paragraph import CT_P
+            from docx.table import Table
+            from docx.text.paragraph import Paragraph as DocxParagraph
+
+            for child in doc.element.body.iterchildren():
+                if isinstance(child, CT_P):
+                    para = DocxParagraph(child, doc)
+                    text = para.text.strip()
+                    if text:
+                        lines.append(text)
+                elif isinstance(child, CT_Tbl):
+                    tbl = Table(child, doc)
+                    for row in tbl.rows:
+                        row_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
+                        if row_text:
+                            lines.append(row_text)
+        except ImportError:
+            lines.append("Cannot preview legacy DOCX files. Python-docx is not installed.")
 
     if q:
         lowered = q.lower()
@@ -610,7 +622,7 @@ def merge_parts_endpoint(document_id: str, body: MergeRequest, db: Session = Dep
     )
 
 
-@router.get("/{document_id}/merge-status", response_model=MergeJobStatusResponse)
+@router.get("/{document_id}/merge-status", response_model=MergeJobStatusResponse | None)
 def get_merge_status(document_id: str, db: Session = Depends(get_db)):
     document = db.query(Document).filter(Document.id == document_id).first()
     if not document:
@@ -624,7 +636,7 @@ def get_merge_status(document_id: str, db: Session = Depends(get_db)):
     )
 
     if not merge_job:
-        raise HTTPException(status_code=404, detail="No merge job found for this document.")
+        return None
 
     status_val = merge_job.status.value if hasattr(merge_job.status, "value") else str(merge_job.status)
     download_url = None
@@ -753,3 +765,28 @@ def delete_document(document_id: str, db: Session = Depends(get_db)):
             pass
 
     return {"status": "success", "message": "Document deleted."}
+
+@router.get("/test_escape")
+def test_escape():
+    from build_typst_book import escape_typst
+    return {"escaped": escape_typst("<test>")}
+
+@router.get("/test_escape_route")
+def test_escape_route():
+    import sys, os
+    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
+    try:
+        from build_typst_book import escape_typst
+        return {"result": repr(escape_typst("<1 minute"))}
+    except Exception as e:
+        return {"error": str(e)}
+
+@router.get("/test/escape-typst-now")
+def test_escape_now():
+    import sys, os
+    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
+    try:
+        from build_typst_book import escape_typst
+        return {"result": repr(escape_typst("<1 minute"))}
+    except Exception as e:
+        return {"error": str(e)}

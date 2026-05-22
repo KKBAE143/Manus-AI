@@ -504,7 +504,7 @@ def get_global_review_queue(db: Session = Depends(get_db)):
 def get_export_profile(document_id: str, db: Session = Depends(get_db)):
     document = db.query(Document).filter(Document.id == document_id).first()
     if not document:
-        raise HTTPException(status_code=404, detail="Document not found.")
+        return None
 
     profile = db.query(ExportProfile).filter(ExportProfile.document_id == document_id).first()
     if not profile:

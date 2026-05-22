@@ -7,14 +7,14 @@ import glob
 
 def escape_typst(text):
     """
-    Escapes Typst special characters: #, *, _, =, [, ], $
+    Escapes Typst special characters: #, *, _, =, [, ], $, <, >
     """
     if not isinstance(text, str):
         return str(text)
 
     # We use a backslash to escape these characters
     # In Typst, \ acts as an escape character
-    special_chars = r'([#*_=\[\]$])'
+    special_chars = r'([\\#*_=\[\]$<>])'
     return re.sub(special_chars, r'\\\1', text)
 
 def parse_table(content):
@@ -45,7 +45,8 @@ def parse_table(content):
 
     num_columns = max(len(row) for row in rows)
 
-    typst_table = f"#block(breakable: false, table(\n"
+    # Use a standard table without the unbreakable block wrapper so it breaks across pages naturally
+    typst_table = f"#table(\n"
     typst_table += f"  columns: ({num_columns}),\n"
     typst_table += f"  inset: 10pt,\n"
     typst_table += f"  align: horizon,\n"
@@ -58,7 +59,7 @@ def parse_table(content):
         cells_str = ", ".join([f"[{escape_typst(cell)}]" for cell in row])
         typst_table += f"  {cells_str},\n"
 
-    typst_table += "))"
+    typst_table += ")"
     return typst_table
 
 def build_book(input_dir, output_file):

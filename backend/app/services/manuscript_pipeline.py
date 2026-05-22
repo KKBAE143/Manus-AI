@@ -52,14 +52,181 @@ from pdf_to_clean_docx import (  # noqa: E402
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")))
 try:
     from extract_and_clean import clean_page_text as heuristic_clean
-    from semantic_tagger import CloudflarePool, call_cloudflare_ai
-    from build_typst_book import escape_typst, parse_table
+    from build_typst_book import parse_table
 except ImportError:
     heuristic_clean = clean_page_text
-    CloudflarePool = None
-    call_cloudflare_ai = None
-    escape_typst = None
     parse_table = None
+
+import re as _re
+
+def escape_typst(text: str) -> str:
+    """Escapes Typst special characters properly to fix unclosed labels.
+    Implemented locally to guarantee Uvicorn hot-reloads it."""
+    if not isinstance(text, str):
+        return str(text)
+    # The backslash \ MUST be the first thing replaced if we were replacing literal backslashes
+    # but Typst uses \ to escape its own special symbols.
+    special_chars = r'([\\\\#*_=\[\]$<>])'
+    return _re.sub(special_chars, r'\\\\\1', text)
+
+# ---------------------------------------------------------------------------
+# Production-level semantic tagger — strict heading classification
+# ---------------------------------------------------------------------------
+
+# H1: ONLY explicit structural markers (Chapter, Module, Part, Unit, Section, Appendix)
+_H1_PATTERNS = [
+    _re.compile(r"^\s*chapter\s+\d+", _re.I),
+    _re.compile(r"^\s*module\s+\d+", _re.I),
+    _re.compile(r"^\s*part\s+[IVXLCDM\d]+", _re.I),
+    _re.compile(r"^\s*unit\s+\d+", _re.I),
+    _re.compile(r"^\s*section\s+\d+", _re.I),
+    _re.compile(r"^\s*appendix\s+[A-Z\d]", _re.I),
+]
+
+# H2: numbered sections like "1. Introduction" or "12. Summary"
+_H2_PATTERNS = [
+    _re.compile(r"^\s*\d{1,2}\.\s+[A-Z][a-zA-Z]"),
+    _re.compile(r"^\s*\d{1,2}\)\s+[A-Z][a-zA-Z]"),
+]
+
+# H3: sub-sections like "1.1 Overview" or "a) Details"
+_H3_PATTERNS = [
+    _re.compile(r"^\s*\d{1,2}\.\d{1,2}\.?\s+[A-Z]"),
+    _re.compile(r"^\s*[a-z]\)\s+[A-Z]"),
+]
+
+# List items
+_LIST_RE = _re.compile(
+    r"^\s*(?:[-\u2013\u2014\u2022\u25cf\u25aa\u25ab\u2023\u00b7]\s+"
+    r"|[a-zA-Z0-9]{1,3}[.)]\s+"
+    r"|\d{1,3}[.)]\s+)"
+)
+
+# Table detection (pipe-delimited)
+_TABLE_RE = _re.compile(r"^\s*\|.+\|.+\|\s*$")
+
+# Speaker labels — always body, never headings
+_SPEAKER_RE = _re.compile(
+    r"^\s*(?:USER|GPT|ChatGPT|Assistant|You|Human|AI|System)\s*[:\-]\s*",
+    _re.I,
+)
+
+# Conversational openers — always body (these survive extract_and_clean.py sometimes)
+_CONVERSATIONAL_OPENER_RE = _re.compile(
+    r"^\s*(?:"
+    r"Sure[,!.]?\s|Absolutely[,!.]?\s|Great[,!.]?\s|Perfect[,!.]?\s|Excellent[,!.]?\s|"
+    r"Here'?s\s|Let me\s|Let's\s|I'll\s|I will\s|I've\s|Would you\s|Shall I\s|"
+    r"Of course[,!.]?\s|Certainly[,!.]?\s|No worries|Awesome[,!.]?\s|"
+    r"Now let'?s\s|Now I'll\s|Moving on\s|Moving forward\s|"
+    r"Below is\s|As promised|As I mentioned|As we discussed"
+    r")",
+    _re.I,
+)
+
+# Code fence marker
+_CODE_FENCE_RE = _re.compile(r"^\s*```")
+
+
+def _local_semantic_tag(text: str) -> list:
+    """Classify text lines into H1/H2/H3/body/table/list/code using strict heuristics.
+
+    Design principles:
+    - Body is the DEFAULT. Everything is body unless it matches a specific structural pattern.
+    - H1 requires explicit structural markers (Chapter, Module, Part, etc.) — NO ALL-CAPS rule.
+    - H2 requires numbered section format (N. Title) — NO title-case rule.
+    - Speaker labels and conversational openers are ALWAYS body.
+    - Code fences (```) create code blocks.
+    """
+    if not text or not text.strip():
+        return []
+
+    lines = text.split("\n")
+    result = []
+    table_buffer = []
+    code_buffer = []
+    in_code_block = False
+
+    def _flush_table():
+        nonlocal table_buffer
+        if table_buffer:
+            result.append({"tag": "table", "content": "\n".join(table_buffer)})
+            table_buffer = []
+
+    def _flush_code():
+        nonlocal code_buffer, in_code_block
+        if code_buffer:
+            result.append({"tag": "code", "content": "\n".join(code_buffer)})
+            code_buffer = []
+        in_code_block = False
+
+    for line in lines:
+        stripped = line.strip()
+
+        # Code fence toggle
+        if _CODE_FENCE_RE.match(stripped):
+            if in_code_block:
+                _flush_code()
+            else:
+                _flush_table()
+                in_code_block = True
+            continue
+
+        # Inside code block — accumulate without any classification
+        if in_code_block:
+            code_buffer.append(line.rstrip())
+            continue
+
+        if not stripped:
+            _flush_table()
+            continue
+
+        # Table detection
+        if _TABLE_RE.match(line):
+            table_buffer.append(stripped)
+            continue
+
+        _flush_table()
+
+        # GUARD: speaker labels → always body
+        if _SPEAKER_RE.match(stripped):
+            result.append({"tag": "body", "content": stripped})
+            continue
+
+        # GUARD: conversational openers → always body
+        if _CONVERSATIONAL_OPENER_RE.match(stripped):
+            result.append({"tag": "body", "content": stripped})
+            continue
+
+        # H1: ONLY explicit structural patterns — no ALL-CAPS rule
+        is_h1 = any(pat.match(stripped) for pat in _H1_PATTERNS)
+        if is_h1:
+            result.append({"tag": "H1", "content": stripped})
+            continue
+
+        # H2: ONLY numbered section format — no title-case rule
+        is_h2 = any(pat.match(stripped) for pat in _H2_PATTERNS)
+        if is_h2:
+            result.append({"tag": "H2", "content": stripped})
+            continue
+
+        # H3: sub-section headings like "1.1 Overview"
+        is_h3 = any(pat.match(stripped) for pat in _H3_PATTERNS)
+        if is_h3:
+            result.append({"tag": "H3", "content": stripped})
+            continue
+
+        # List items
+        if _LIST_RE.match(stripped):
+            result.append({"tag": "list", "content": stripped})
+            continue
+
+        # Default: body
+        result.append({"tag": "body", "content": stripped})
+
+    _flush_table()
+    if in_code_block:
+        _flush_code()
+    return result
 
 
 _JOB_CONFIG_LOCK = threading.Lock()
@@ -407,25 +574,22 @@ def run_pipeline(document_id: str, job_id: str, db: Session) -> Dict[str, Any]:
             update_job(db, job, stage=5, stage_key="semantic_tagging", stage_name="Semantic Tagging", progress=15.0 + ((int(chunk.chunk_index) - 1) / total_chunks) * 60.0, message=f"Semantic tagging for chunk {chunk.chunk_index}/{total_chunks}")
             chunk.current_stage = "semantic_tagging"
             db.commit()
-            tagging_run = create_chunk_stage_run(db, chunk, "semantic_tagging", "Semantic Tagging", message="Applying Cloudflare AI semantic tagging")
+            tagging_run = create_chunk_stage_run(db, chunk, "semantic_tagging", "Semantic Tagging", message="Applying local semantic tagging")
 
             tagged_path = chunks_dir / f"tagged_chunk_{int(chunk.chunk_index):04d}.json"
-            if CloudflarePool:
-                try:
-                    pool = CloudflarePool()
-                    from semantic_tagger import process_file as tag_file
-                    tag_file(json_path, tagged_path, pool)
-                    register_artifact(db, document_id, ArtifactType.cleaned_text, f"Chunk {chunk.chunk_index} tagged JSON", tagged_path, chunk.id)
-                    finish_chunk_stage_run(db, tagging_run, status=ChunkStageStatus.completed, message="Semantic tagging complete")
-                except Exception as e:
-                    log_event(db, document_id, f"Tagging error: {e}", level="ERROR", stage_key="semantic_tagging", chunk_id=chunk.id)
-                    finish_chunk_stage_run(db, tagging_run, status=ChunkStageStatus.failed, message=f"Tagging failed: {e}")
-                    dummy_tagged = [{"tag": "body", "content": p["text"]} for p in cleaned_pages_data]
-                    tagged_path.write_text(json.dumps(dummy_tagged, ensure_ascii=False, indent=2), encoding="utf-8")
-            else:
-                dummy_tagged = [{"tag": "body", "content": p["text"]} for p in cleaned_pages_data]
-                tagged_path.write_text(json.dumps(dummy_tagged, ensure_ascii=False, indent=2), encoding="utf-8")
-                finish_chunk_stage_run(db, tagging_run, status=ChunkStageStatus.completed, message="Tagging skipped (dummy used)")
+            try:
+                all_tagged = []
+                for p in cleaned_pages_data:
+                    page_tags = _local_semantic_tag(p.get("text", ""))
+                    all_tagged.extend(page_tags)
+                tagged_path.write_text(json.dumps(all_tagged, ensure_ascii=False, indent=2), encoding="utf-8")
+                register_artifact(db, document_id, ArtifactType.cleaned_text, f"Chunk {chunk.chunk_index} tagged JSON", tagged_path, chunk.id)
+                finish_chunk_stage_run(db, tagging_run, status=ChunkStageStatus.completed, message="Local semantic tagging complete")
+            except Exception as e:
+                log_event(db, document_id, f"Tagging error: {e}", level="ERROR", stage_key="semantic_tagging", chunk_id=chunk.id)
+                finish_chunk_stage_run(db, tagging_run, status=ChunkStageStatus.failed, message=f"Tagging failed: {e}")
+                fallback_tagged = [{"tag": "body", "content": p["text"]} for p in cleaned_pages_data]
+                tagged_path.write_text(json.dumps(fallback_tagged, ensure_ascii=False, indent=2), encoding="utf-8")
 
             update_job(db, job, stage=6, stage_key="part_generate", stage_name="Generating Typst Manuscript", progress=25.0 + (int(chunk.chunk_index) / total_chunks) * 60.0, message=f"Generating Typst for chunk {chunk.chunk_index}/{total_chunks}")
             chunk.current_stage = "part_generate"
@@ -438,15 +602,32 @@ def run_pipeline(document_id: str, job_id: str, db: Session) -> Dict[str, Any]:
                     with open(tagged_path, 'r', encoding='utf-8') as jf:
                         tagged_content = json.load(jf)
                     if not isinstance(tagged_content, list): tagged_content = [tagged_content]
+
+                    prev_tag = None
                     for item in tagged_content:
                         tag = item.get("tag", item.get("type", "body"))
                         content = item.get("content", "")
-                        if tag == "H1": f.write(f"= {escape_typst(content)}\n\n")
-                        elif tag == "H2": f.write(f"== {escape_typst(content)}\n\n")
-                        elif tag == "H3": f.write(f"=== {escape_typst(content)}\n\n")
-                        elif tag == "list": f.write(f"- {escape_typst(content)}\n")
-                        elif tag == "table": f.write(f"{parse_table(content)}\n\n")
-                        else: f.write(f"{escape_typst(content)}\n\n")
+
+                        if tag == "body" and prev_tag == "body":
+                            # Merge consecutive body blocks with a space
+                            f.write(f" {escape_typst(content)}")
+                        else:
+                            # If previous was body and this is NOT body, we need to close the body paragraph
+                            if prev_tag == "body" and tag != "body":
+                                f.write("\n\n")
+
+                            if tag == "H1": f.write(f"= {escape_typst(content)}\n\n")
+                            elif tag == "H2": f.write(f"== {escape_typst(content)}\n\n")
+                            elif tag == "H3": f.write(f"=== {escape_typst(content)}\n\n")
+                            elif tag == "list": f.write(f"- {escape_typst(content)}\n")
+                            elif tag == "table": f.write(f"{parse_table(content)}\n\n")
+                            elif tag == "code": f.write(f"```text\n{content}\n```\n\n")
+                            else: f.write(f"{escape_typst(content)}")
+
+                        prev_tag = tag
+
+                    if prev_tag == "body" or prev_tag == "list":
+                        f.write("\n\n")
 
                 # Create dummy ExportPart for pipeline compatibility
                 export_part = ExportPart(
@@ -478,11 +659,58 @@ def run_pipeline(document_id: str, job_id: str, db: Session) -> Dict[str, Any]:
         flush_log_events(db)
         pdf.close()
 
+        # Build merged Typst book and compile to PDF
+        merged_typ = outputs_dir / "book.typ"
+        manifest_path = manifests_dir / "manifest.json"
+        try:
+            with open(merged_typ, "w", encoding="utf-8") as mf:
+                mf.write('#set page(paper: "a4", margin: (x: 2.5cm, y: 2.5cm), numbering: "1", header: align(right)[Manuscript])\n')
+                mf.write('#set text(font: "Linux Libertine", fallback: true, size: 11pt, leading: 0.65em)\n')
+                mf.write('#set par(justify: true)\n')
+                mf.write('#show heading: set block(above: 1.5em, below: 1em)\n')
+                mf.write('#outline(title: "Table of Contents", depth: 2)\n')
+                mf.write('#pagebreak()\n\n')
+                for chunk in chunk_ranges:
+                    typ_file = outputs_dir / f"chunk_{int(chunk.chunk_index):04d}.typ"
+                    if typ_file.exists():
+                        mf.write(typ_file.read_text(encoding="utf-8"))
+                        # Don't force pagebreaks between chunks unless we want a new page per chunk
+                        # mf.write("\n#pagebreak()\n\n")
+
+            # Compile to PDF using typst
+            compiled_pdf = outputs_dir / "book.pdf"
+            try:
+                import typst as typst_compiler
+                typst_compiler.compile(str(merged_typ), output=str(compiled_pdf))
+                register_artifact(db, document_id, ArtifactType.merged_pdf, "Compiled PDF book", compiled_pdf)
+            except Exception as compile_err:
+                log_event(db, document_id, f"Typst compilation warning: {compile_err}", level="WARNING")
+
+            # Write manifest
+            manifest_data = {
+                "document_id": document_id,
+                "total_pages": total_pages,
+                "chunks": len(chunk_ranges),
+                "parts": [str(outputs_dir / f"chunk_{int(c.chunk_index):04d}.typ") for c in chunk_ranges],
+                "merged_typ": str(merged_typ),
+                "compiled_pdf": str(compiled_pdf) if compiled_pdf.exists() else None,
+            }
+            manifest_path.write_text(json.dumps(manifest_data, indent=2), encoding="utf-8")
+            register_artifact(db, document_id, ArtifactType.manifest, "Build manifest", manifest_path)
+        except Exception as merge_err:
+            log_event(db, document_id, f"Merge/compile error: {merge_err}", level="ERROR")
+
+        document.status = DocumentStatus.ready
         update_job(db, job, stage=7, stage_key="completed", stage_name="Completed", progress=100.0, message="Pipeline complete")
         db.commit()
 
     except Exception as e:
         log_event(db, document_id, f"Pipeline error: {e}", level="ERROR")
+        document.status = DocumentStatus.failed
+        document.error_log = str(e)
+        job.status = JobStatus.failed
+        job.error_log = str(e)
+        db.commit()
         raise e
 
     return {
@@ -490,8 +718,7 @@ def run_pipeline(document_id: str, job_id: str, db: Session) -> Dict[str, Any]:
         "job_id": job_id,
         "page_count": total_pages,
         "parts_generated": len(created_parts),
-        "manifest_path": str(manifest_path),
-        "appendix_path": str(appendix_path) if appendix_path else None,
+        "manifest_path": str(manifest_path) if manifest_path.exists() else None,
     }
 
 
@@ -698,15 +925,18 @@ def merge_document_parts(document: Document, parts: list[ExportPart]) -> Path:
     merged_pdf_path = merge_dir / f"{Path(document.filename).stem}_final.pdf"
 
     with open(master_typ_path, "w", encoding="utf-8") as f:
-        f.write("#set page(margin: (x: 2.5cm, y: 2.5cm), numbering: \"1\")\n")
-        f.write("#set text(font: \"Linux Libertine\", size: 10pt, leading: 0.65em)\n")
-        f.write("#show heading: set block(above: 1.2em, below: 0.8em)\n\n")
+        f.write('#set page(paper: "a4", margin: (x: 2.5cm, y: 2.5cm), numbering: "1", header: align(right)[Manuscript])\n')
+        f.write('#set text(font: "Linux Libertine", fallback: true, size: 11pt, leading: 0.65em)\n')
+        f.write('#set par(justify: true)\n')
+        f.write('#show heading: set block(above: 1.5em, below: 1em)\n')
+        f.write('#outline(title: "Table of Contents", depth: 2)\n')
+        f.write('#pagebreak()\n\n')
 
         for part in parts:
-            if Path(part.local_docx_path).exists():
-                # We reuse local_docx_path field in db for the typst path for now
-                part_path = str(Path(part.local_docx_path).absolute()).replace("\\", "/")
-                f.write(f'#include "{part_path}"\n\n')
+            part_file = Path(part.local_docx_path)
+            if part_file.exists():
+                f.write(part_file.read_text(encoding="utf-8"))
+                f.write("\n\n")
 
     import typst
     typst.compile(str(master_typ_path), output=str(merged_pdf_path))
@@ -759,9 +989,8 @@ def _build_front_matter_docx(profile, output_path: Path) -> None:
 
 
 def merge_parts_ordered(document: Document, parts: list[ExportPart], profile=None, progress_callback=None) -> Path:
-    """Merge ExportPart DOCX files in caller-supplied order, preserving formatting.
+    """Merge ExportPart Typst files in caller-supplied order, preserving formatting.
     If a profile with book_title or author is provided, a front matter page is prepended.
-    After merge, a post-processing pass adds TOC + consistent header/footer to the merged DOCX.
     progress_callback(percent: float, message: str) is called periodically if provided."""
     if not parts:
         raise ValueError("No parts provided to merge")
@@ -787,34 +1016,50 @@ def merge_parts_ordered(document: Document, parts: list[ExportPart], profile=Non
 
     total_parts = len(parts)
 
-    if has_front_matter:
-        _emit(10.0, "Building front matter")
-        front_matter_path = merge_dir / f"{document.id}_front_matter.docx"
-        _build_front_matter_docx(profile, front_matter_path)
-        master = DocxDocument(str(front_matter_path))
-        composer = Composer(master)
+    master_typ_path = merge_dir / f"{Path(document.filename).stem}_master.typ"
+    merged_pdf_path = merge_dir / f"{Path(document.filename).stem}_final.pdf"
+
+    with open(master_typ_path, "w", encoding="utf-8") as f:
+        f.write('#set page(paper: "a4", margin: (x: 2.5cm, y: 2.5cm), numbering: "1", header: align(right)[Manuscript])\n')
+        f.write('#set text(font: "Linux Libertine", fallback: true, size: 11pt, leading: 0.65em)\n')
+        f.write('#set par(justify: true)\n')
+        f.write('#show heading: set block(above: 1.5em, below: 1em)\n\n')
+
+        if has_front_matter:
+            _emit(10.0, "Building front matter")
+            f.write('#align(center, block(width: 100%)[\n')
+            if getattr(profile, "book_title", None):
+                f.write(f'  #text(size: 24pt, weight: "bold")[{escape_typst(profile.book_title)}]\n  #v(1em)\n')
+            if getattr(profile, "subtitle", None):
+                f.write(f'  #text(size: 16pt)[{escape_typst(profile.subtitle)}]\n  #v(2em)\n')
+            if getattr(profile, "author", None):
+                f.write(f'  #text(size: 14pt)[{escape_typst(profile.author)}]\n  #v(1em)\n')
+            if getattr(profile, "institution", None):
+                f.write(f'  #text(size: 12pt)[{escape_typst(profile.institution)}]\n')
+            f.write('])\n\n#pagebreak()\n\n')
+
+            if getattr(profile, "copyright_text", None):
+                f.write(f'#align(center)[#text(size: 10pt)[{escape_typst(profile.copyright_text)}]]\n\n#pagebreak()\n\n')
+
+        include_toc = not profile or bool(getattr(profile, "include_toc", True))
+        if include_toc:
+            f.write('#outline(title: "Table of Contents", depth: 2)\n#pagebreak()\n\n')
+
         for i, part in enumerate(parts):
             pct = 15.0 + ((i + 1) / total_parts) * 70.0
             _emit(pct, f"Stitching part {i + 1} of {total_parts}")
-            composer.append(DocxDocument(part.local_docx_path))
-    else:
-        _emit(15.0, f"Loading part 1 of {total_parts}")
-        master = DocxDocument(parts[0].local_docx_path)
-        composer = Composer(master)
-        for i, part in enumerate(parts[1:], start=1):
-            pct = 15.0 + ((i + 1) / total_parts) * 70.0
-            _emit(pct, f"Stitching part {i + 1} of {total_parts}")
-            composer.append(DocxDocument(part.local_docx_path))
 
-    _emit(85.0, "Saving merged DOCX")
-    merged_path = merge_dir / f"{Path(document.filename).stem}_merged.docx"
-    composer.save(str(merged_path))
+            part_file = Path(part.local_docx_path)
+            if part_file.exists():
+                f.write(part_file.read_text(encoding="utf-8"))
+                f.write("\n\n")
 
-    _emit(90.0, "Applying publication-quality post-processing (TOC + headers/footers)")
-    _post_process_merged_docx(str(merged_path), profile)
+    _emit(85.0, "Compiling PDF")
+    import typst
+    typst.compile(str(master_typ_path), output=str(merged_pdf_path))
 
     _emit(100.0, "Merge complete")
-    return merged_path
+    return merged_pdf_path
 
 
 def _post_process_merged_docx(docx_path: str, profile=None) -> None:

@@ -125,21 +125,23 @@ export default function FinalAssembly() {
       // Hydrate merge status on load
       try {
         const status = await api.getMergeStatus(id);
-        setMergeJobStatus(status);
-        if (status.status === 'COMPLETED') {
-          setMergePhase('done');
-          setMergedDocxAvailable(true);
-          setDownloadUrl(
-            status.download_url
-              ? absoluteUrl(status.download_url)
-              : absoluteUrl(`/api/v1/documents/${id}/merged/download`)
-          );
-        } else if (status.status === 'IN_PROGRESS' || status.status === 'PENDING') {
-          setMergePhase('polling');
-          startPolling();
-        } else if (status.status === 'FAILED') {
-          setMergePhase('error');
-          setMergeError(status.error_log || 'Previous merge failed.');
+        if (status) {
+          setMergeJobStatus(status);
+          if (status.status === 'COMPLETED') {
+            setMergePhase('done');
+            setMergedDocxAvailable(true);
+            setDownloadUrl(
+              status.download_url
+                ? absoluteUrl(status.download_url)
+                : absoluteUrl(`/api/v1/documents/${id}/merged/download`)
+            );
+          } else if (status.status === 'IN_PROGRESS' || status.status === 'PENDING') {
+            setMergePhase('polling');
+            startPolling();
+          } else if (status.status === 'FAILED') {
+            setMergePhase('error');
+            setMergeError(status.error_log || 'Previous merge failed.');
+          }
         }
       } catch {
         // No merge job yet; that's fine
@@ -253,7 +255,7 @@ export default function FinalAssembly() {
     <main className="flex-1 flex flex-col h-full overflow-hidden">
       <Header
         title={filename || 'Final Assembly'}
-        subtitle="Order parts and generate your final merged manuscript DOCX."
+        subtitle="Order parts and generate your final merged manuscript PDF."
       />
 
       <div className="bg-white border-b border-gray-100 px-4 py-3 flex items-center gap-3 flex-wrap shrink-0">
@@ -283,7 +285,7 @@ export default function FinalAssembly() {
 
           {rows.length === 0 && (
             <div className="text-sm text-[#888888] text-center py-16">
-              No DOCX parts found for this document. Run the processing pipeline first.
+              No PDF parts found for this document. Run the processing pipeline first.
             </div>
           )}
 
@@ -388,7 +390,7 @@ export default function FinalAssembly() {
           <div className="border-t border-gray-100 pt-5 space-y-3">
             <h3 className="font-semibold text-sm">Generate Final Manuscript</h3>
             <p className="text-xs text-[#888888]">
-              Merges all included parts into one DOCX file in the order shown, preserving all formatting.
+              Merges all included parts into one PDF file in the order shown, preserving all formatting.
             </p>
 
             {mergePhase === 'idle' && (
@@ -397,7 +399,7 @@ export default function FinalAssembly() {
                 disabled={activeCount === 0}
                 className="w-full px-4 py-2 rounded-xl bg-[#222222] text-white text-sm font-medium hover:bg-[#333] disabled:opacity-50 flex items-center justify-center gap-2"
               >
-                <FileText size={14} /> Generate Manuscript (DOCX)
+                <FileText size={14} /> Generate Manuscript (PDF)
               </button>
             )}
 
@@ -426,7 +428,7 @@ export default function FinalAssembly() {
                   href={downloadUrl}
                   className="w-full flex items-center justify-center gap-2 px-4 py-2 rounded-xl bg-green-600 text-white text-sm font-medium hover:bg-green-700"
                 >
-                  <Download size={14} /> Download DOCX
+                  <Download size={14} /> Download PDF
                 </a>
                 <button
                   onClick={handleRetry}
@@ -457,7 +459,7 @@ export default function FinalAssembly() {
                 href={absoluteUrl(`/api/v1/documents/${id}/merged/download`)}
                 className="w-full flex items-center justify-center gap-2 px-4 py-2 rounded-xl border border-[#6A8776] text-[#6A8776] text-sm font-medium hover:bg-[#F0F6F2]"
               >
-                <Download size={14} /> Re-download Last Merged DOCX
+                <Download size={14} /> Re-download Last Merged PDF
               </a>
             )}
           </div>

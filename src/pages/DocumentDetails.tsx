@@ -194,6 +194,20 @@ export default function DocumentDetails() {
     return ACTIVE_DOCUMENT_STATUSES.has(documentStatus) || ACTIVE_JOB_STATUSES.has(jobStatus);
   }, [document]);
 
+  // Auto-redirect to Final Assembly when pipeline finishes processing during this session
+  const prevStatusRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!document || !document.latest_job) return;
+    const currentStatus = document.latest_job.status.toUpperCase();
+
+    // If the status transitioned from an active state to COMPLETED while viewing this page
+    if (prevStatusRef.current && ACTIVE_JOB_STATUSES.has(prevStatusRef.current) && currentStatus === 'COMPLETED') {
+      navigate(`/assembly/${document.id}`);
+    }
+
+    prevStatusRef.current = currentStatus;
+  }, [document, navigate]);
+
   usePollingBackoff({
     enabled: !!(id && shouldPoll),
     onPoll: useCallback(async () => {
@@ -339,7 +353,7 @@ export default function DocumentDetails() {
                   href={absoluteUrl(`/api/v1/documents/${document.id}/merged/download`)}
                   className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-[#1D2E24] text-white text-sm font-semibold hover:bg-[#2a3f32]"
                 >
-                  <Download size={14} /> Download Typst
+                  <Download size={14} /> Download PDF
                 </a>
               )}
               <a
