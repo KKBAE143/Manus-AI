@@ -108,6 +108,18 @@ def _cleanup_stale_jobs():
 
 _cleanup_stale_jobs()
 
+
+# When deployed on HF Spaces with sync enabled, re-hydrate the library from
+# the private dataset so files survive a Space restart.
+try:
+    from app.services import hf_storage_sync as _hf_sync
+
+    if _hf_sync.is_enabled():
+        _library_dir = Path(settings.STORAGE_ROOT) / "quiz" / "library"
+        _hf_sync.restore_on_startup(_library_dir)
+except Exception:  # pragma: no cover - never break startup on sync issues
+    pass
+
 app = FastAPI(title=settings.PROJECT_NAME, version="2.0.0")
 
 app.add_middleware(GZipMiddleware, minimum_size=1024)

@@ -43,6 +43,7 @@ from app.services.answer_key_parser import (
     parse_answer_key,
 )
 from app.services.quiz_cleaner import clean_quiz_pdf, inspect_quiz_questions
+from app.services import hf_storage_sync
 
 router = APIRouter(prefix="/api/v1/quiz", tags=["quiz"])
 
@@ -289,6 +290,9 @@ async def confirm_quiz(payload: ConfirmRequest = Body(...)):
     }
     _write_meta(result_dir, record)
 
+    # Mirror this entry to the private HF dataset (no-op when sync is off).
+    hf_storage_sync.upload_entry_async(result_dir, f"library/{result_id}")
+
     # Clean staging
     shutil.rmtree(job_dir, ignore_errors=True)
 
@@ -340,6 +344,8 @@ def delete_result(result_id: str):
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="Result not found")
     shutil.rmtree(job_dir, ignore_errors=True)
+    # Mirror the delete to the HF dataset too (no-op when sync is off).
+    hf_storage_sync.delete_entry_async(f"library/{result_id}")
     return {"status": "deleted", "id": result_id}
 
 
