@@ -14,6 +14,49 @@ backend/venv/
 .local/
 .claude/
 .agents/
+.kiro/
+.genkit/
+.vscode/
 
 # Generated backend runtime data
 backend/storage/
+backend/sql_app.db
+backend/test_db.py
+backend/_*.py
+
+# --- Local scratch/dev artifacts kept out of the repo -----------------------
+
+# Image artifacts dumped at the repo root by old extraction scripts.
+# Real source images should live inside src/ or backend/ folders.
+/image_*.jpeg
+/image_*.jpg
+/image_*.png
+/image*.png
+
+# Top-level scratch / debug python files used during prototyping
+/test_*.py
+/check_*.py
+/find_*.py
+/debug_*.py
+/compare_*.py
+/read_*.py
+/get_error.py
+/extract_qa.py
+/fix_typ_files.py
+/final_clean_part01.py
+
+# Sample exam PDFs / DOCX uploaded by hand at the repo root
+/test.pdf
+/test.txt
+/test.typ
+/test_output.typ
+/test_typst.typ
+/debug_out.txt
+/extracted_questions.md
+/tab-1.pdf
+/tab-1_merged.docx
+/LIFE\ SCIENCES*.pdf
+/New\ folder/
+/_git_changes.txt
+/_untracked.txt
+/_untracked*.txt
