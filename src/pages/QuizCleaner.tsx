@@ -47,6 +47,7 @@ export default function QuizCleaner() {
     try {
       const r = await api.listQuizLibrary();
       setLibrary(r.items);
+      setBackendUnavailable(false);
     } catch (err) {
       if (isBackendUnavailableError(err)) setBackendUnavailable(true);
     } finally {
@@ -54,9 +55,42 @@ export default function QuizCleaner() {
     }
   };
 
+  // On mount: try the library once immediately, then keep retrying
+  // every 1.5s while the backend is still warming up so the page
+  // self-recovers without the user having to refresh.
   useEffect(() => {
-    refreshLibrary();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const tick = async (attempt: number) => {
+      if (cancelled) return;
+      try {
+        const r = await api.listQuizLibrary();
+        if (cancelled) return;
+        setLibrary(r.items);
+        setBackendUnavailable(false);
+        setLibraryLoading(false);
+      } catch (err) {
+        if (cancelled) return;
+        if (isBackendUnavailableError(err)) {
+          setBackendUnavailable(true);
+          setLibraryLoading(false);
+          if (attempt < 20) {
+            timer = setTimeout(() => tick(attempt + 1), 1500);
+          }
+        } else {
+          setLibraryLoading(false);
+        }
+      }
+    };
+
+    setLibraryLoading(true);
+    tick(0);
+
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
   }, []);
 
   const reset = () => {

@@ -1,6 +1,12 @@
+import os
+from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.api.documents import router as documents_router
 from app.api.test import router as test_router
@@ -105,9 +111,14 @@ _cleanup_stale_jobs()
 app = FastAPI(title=settings.PROJECT_NAME, version="2.0.0")
 
 app.add_middleware(GZipMiddleware, minimum_size=1024)
+
+# CORS: in dev we allow everything (Vite proxy means this rarely matters);
+# in prod we lock to the public origin(s) listed in CORS_ALLOW_ORIGINS.
+_cors_env = os.environ.get("CORS_ALLOW_ORIGINS", "").strip()
+_cors_origins = [o.strip() for o in _cors_env.split(",") if o.strip()] if _cors_env else ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -119,14 +130,50 @@ app.include_router(manuscript_router)
 app.include_router(quiz_router)
 
 
-@app.get("/")
-def read_root():
-    return {"message": f"Welcome to the {settings.PROJECT_NAME} API"}
-
-
 @app.get("/api/health")
 def health_check():
     return {"status": "healthy"}
+
+
+# --- Static frontend serving (production) -----------------------------------
+# In production the React bundle is built into FRONTEND_DIST_DIR (defaults to
+# /app/frontend in the Docker image). When that folder exists, FastAPI serves
+# it for any non-/api route, with a fallback to index.html so client-side
+# routing (react-router) works on hard refreshes.
+_FRONTEND_DIST = Path(os.environ.get("FRONTEND_DIST_DIR", "/app/frontend"))
+
+
+if _FRONTEND_DIST.is_dir() and (_FRONTEND_DIST / "index.html").exists():
+    # Serve hashed asset bundles directly with long-cache headers.
+    if (_FRONTEND_DIST / "assets").is_dir():
+        app.mount(
+            "/assets",
+            StaticFiles(directory=str(_FRONTEND_DIST / "assets")),
+            name="frontend-assets",
+        )
+
+    @app.get("/")
+    def _serve_index():
+        return FileResponse(str(_FRONTEND_DIST / "index.html"))
+
+    @app.exception_handler(StarletteHTTPException)
+    async def _spa_fallback(request, exc):
+        # Only intercept 404s for non-API GETs.
+        if (
+            exc.status_code == 404
+            and request.method == "GET"
+            and not request.url.path.startswith("/api/")
+        ):
+            index = _FRONTEND_DIST / "index.html"
+            if index.exists():
+                return FileResponse(str(index))
+        # Re-raise the original exception so FastAPI's normal handler runs.
+        from fastapi.exception_handlers import http_exception_handler
+        return await http_exception_handler(request, exc)
+else:
+    @app.get("/")
+    def read_root():
+        return {"message": f"Welcome to the {settings.PROJECT_NAME} API"}
 
 
 if __name__ == "__main__":

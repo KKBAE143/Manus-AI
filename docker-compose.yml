@@ -1,0 +1,76 @@
+version: "3.9"
+
+# ============================================================================
+# Production stack for an Oracle Cloud Always Free VM:
+#
+#   - app    : FastAPI + the built React frontend, persistent storage volume
+#   - caddy  : reverse proxy with automatic Let's Encrypt HTTPS
+#   - keepalive: tiny CPU/network heartbeat so Oracle does not flag the VM
+#                as idle and reclaim it (Oracle reclaim threshold = under
+#                10% CPU + low net + low disk for 7 days)
+#
+# Re-deploy with:  ./deploy/deploy.sh
+# ============================================================================
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: manus-ai:latest
+    restart: unless-stopped
+    environment:
+      STORAGE_ROOT: /var/data/storage
+      FRONTEND_DIST_DIR: /app/frontend
+      PYTHONPATH: /app/backend
+      # Comma-separated list of allowed origins. Set to your public URL in
+      # the .env file on the VM, e.g. https://exam.example.com
+      CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-}
+      # Optional - leave blank if you do not use Gemini features.
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    volumes:
+      # Persistent storage on the VM. Survives docker compose down + restarts.
+      - storage:/var/data/storage
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      # Set DOMAIN in .env on the VM, e.g. exam.example.com
+      DOMAIN: ${DOMAIN:?DOMAIN must be set in .env (e.g. exam.example.com)}
+    depends_on:
+      - app
+
+  keepalive:
+    image: alpine:3
+    restart: unless-stopped
+    command: >
+      sh -c "apk add --no-cache curl >/dev/null 2>&1;
+             while true; do
+               curl -s -o /dev/null http://app:8000/api/health;
+               # tiny CPU burn so Oracle does not see 100% idle
+               head -c 1m /dev/urandom | md5sum > /dev/null;
+               sleep 600;
+             done"
+    depends_on:
+      - app
+
+volumes:
+  storage:
+  caddy_data:
+  caddy_config:

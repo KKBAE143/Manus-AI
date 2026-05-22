@@ -1,0 +1,49 @@
+# Big stuff that must never be in the image
+node_modules
+dist
+build
+backend/venv
+backend/storage
+backend/sql_app.db
+**/__pycache__
+**/*.pyc
+
+# Local sample data
+New folder/
+*.pdf
+*.docx
+image_*.jpeg
+image_*.jpg
+image_*.png
+image*.png
+
+# Local dev / IDE
+.git
+.gitignore
+.vscode
+.kiro
+.local
+.claude
+.agents
+.genkit
+.env
+.env.*
+!.env.example
+
+# Scratch scripts at repo root
+test_*.py
+check_*.py
+find_*.py
+debug_*.py
+compare_*.py
+read_*.py
+get_error.py
+extract_qa.py
+fix_typ_files.py
+
+# Temp helpers
+_*.txt
+debug_out.txt
+extracted_questions.md
+README.md
+replit.md
