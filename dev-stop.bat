@@ -1,31 +1,24 @@
 @echo off
-setlocal enabledelayedexpansion
+setlocal
 
 :: =====================================================================
-:: dev-stop.bat - kill whatever is currently bound to ports 5000 / 8000
+:: dev-stop.bat  v3
+::
+:: Thin wrapper around scripts\dev-cleanup.ps1 which does the heavy
+:: lifting (kills full process trees including reloader children, scoped
+:: to this repository).
 :: =====================================================================
 
+cd /d "%~dp0"
 echo Stopping dev servers...
 
-set "ANY=0"
-for /f "tokens=5" %%P in ('netstat -ano ^| findstr /R /C:":8000 .*LISTENING"') do (
-    if not "%%P"=="" if not "%%P"=="0" (
-        echo   killing PID %%P on :8000
-        taskkill /F /PID %%P >nul 2>&1
-        set "ANY=1"
-    )
-)
-for /f "tokens=5" %%P in ('netstat -ano ^| findstr /R /C:":5000 .*LISTENING"') do (
-    if not "%%P"=="" if not "%%P"=="0" (
-        echo   killing PID %%P on :5000
-        taskkill /F /PID %%P >nul 2>&1
-        set "ANY=1"
-    )
-)
+:: Resolve PowerShell - on some minimal cmd PATHs powershell.exe is not
+:: in PATH so fall back to its hard-coded location.
+set "PS_EXE=powershell.exe"
+where powershell.exe >nul 2>&1
+if errorlevel 1 set "PS_EXE=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
 
-if "!ANY!"=="0" (
-    echo   nothing was running on :5000 or :8000
-)
+"%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\dev-cleanup.ps1" -ProjectDir "%~dp0."
 
 echo Done.
 endlocal
