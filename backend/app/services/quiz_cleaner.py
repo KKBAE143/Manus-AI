@@ -573,8 +573,17 @@ def inspect_quiz_questions(input_path: str | Path) -> dict:
     matching before paying for the heavier render pass.
     """
     input_path = Path(input_path)
+
+    # The CSIR text-PDF format has selectable text (no image-baked questions).
+    # Detect it before opening the heavy block-extraction pipeline.
     src = fitz.open(str(input_path))
     try:
+        from app.services import quiz_textpdf_cleaner
+
+        if quiz_textpdf_cleaner.looks_like_textpdf_format(src):
+            src.close()
+            return quiz_textpdf_cleaner.inspect(input_path)
+
         blocks = _extract_blocks(src)
         kept, section_headers, dropped, fmt = _parse_quiz(blocks)
         return {
@@ -586,7 +595,8 @@ def inspect_quiz_questions(input_path: str | Path) -> dict:
             "format": fmt,
         }
     finally:
-        src.close()
+        if not src.is_closed:
+            src.close()
 
 
 def clean_quiz_pdf(
@@ -613,6 +623,15 @@ def clean_quiz_pdf(
 
     src = fitz.open(str(input_path))
     try:
+        from app.services import quiz_textpdf_cleaner
+
+        if quiz_textpdf_cleaner.looks_like_textpdf_format(src):
+            src.close()
+            return quiz_textpdf_cleaner.clean(
+                input_path, output_path,
+                answer_map=answer_map, answer_subject=answer_subject,
+            )
+
         blocks = _extract_blocks(src)
         kept, section_headers, dropped, fmt = _parse_quiz(blocks)
         render_stats = _render_output_pdf(
@@ -634,7 +653,8 @@ def clean_quiz_pdf(
             "answers_missing": render_stats["answers_missing"],
         }
     finally:
-        src.close()
+        if not src.is_closed:
+            src.close()
 
 
 if __name__ == "__main__":

@@ -89,6 +89,139 @@ class SubjectAnswers:
     duplicates: list[tuple[str, str, str]] = field(default_factory=list)  # (qid, prev_raw, new_raw)
 
 
+# --- CSIR text-PDF style key (used with the textpdf cleaner) ---------------
+
+# Look for a section trailer like "Subject: Life Science" (no parens, no code).
+TEXTPDF_SUBJECT_RE = re.compile(
+    r"Subject\s*:\s*([A-Za-z][A-Za-z &\-]+?)\s*$",
+    re.MULTILINE,
+)
+
+# This format prints each answer cell as "<qid>\n<answer>\n" pairs. Answers
+# can be:
+#   "503"                -> single Option ID
+#   "129 ,132"            -> multiple Option IDs (with weird spacing)
+#   "Dropped"            -> question dropped
+#   "161(English)/Dropped(Hindi)"  -> partial drop, treat raw
+#   "*41"                -> asterisked qids carry footnote info
+TEXTPDF_QID_RE = re.compile(r"^\*?(\d{1,4})$")
+TEXTPDF_ANSWER_RE = re.compile(
+    r"^("
+    r"\d{1,5}(?:\s*,\s*\d{1,5})*"               # 503  or  129 ,132
+    r"|Dropped"
+    r"|\d{1,5}\(English\)/Dropped\(Hindi\)"     # 161(English)/Dropped(Hindi)
+    r"|Dropped\(English\)/\d{1,5}\(Hindi\)"
+    r")$",
+    re.IGNORECASE,
+)
+
+
+def _classify_textpdf_answer(raw: str) -> AnswerEntry:
+    s = raw.strip()
+    if not s:
+        return AnswerEntry(question_id="", raw="", kind="unknown")
+    if re.fullmatch(r"Dropped", s, re.IGNORECASE):
+        return AnswerEntry(question_id="", raw="Dropped", kind="drop")
+    # Multi-Option-ID list like "129 ,132" - keep as multi
+    parts = re.split(r"\s*,\s*", s)
+    if all(p.strip().isdigit() for p in parts):
+        opts = sorted({int(p.strip()) for p in parts if p.strip().isdigit()})
+        if len(opts) == 1:
+            return AnswerEntry(question_id="", raw=str(opts[0]), kind="single", options=opts)
+        return AnswerEntry(question_id="", raw=", ".join(str(o) for o in opts), kind="multi", options=opts)
+    # Hindi/English partial-drop or other - record raw for human review
+    return AnswerEntry(question_id="", raw=s, kind="unknown")
+
+
+def _parse_textpdf_key(doc: fitz.Document) -> dict:
+    """Parse a CSIR text-PDF style answer key.
+
+    Returns the same dict shape as :func:`parse_answer_key`. Each subject
+    gets the textual subject name as both the code and name (since this
+    format has no numeric code), so callers can still look up by name.
+    """
+    subjects: dict[str, SubjectAnswers] = {}
+    subject_order: list[str] = []
+    warnings: list[str] = []
+
+    # Walk the pages and snapshot all tokens *with* their page so we can
+    # bucket per-section. The trailer "Subject: Life Science" appears at
+    # the END of each section's pages, so we collect all tokens for a page,
+    # see which subject the page declares, then attach them.
+    for page_idx in range(len(doc)):
+        page_text = doc[page_idx].get_text()
+        subj_match = TEXTPDF_SUBJECT_RE.search(page_text)
+        if not subj_match:
+            # No declared subject on this page; skip rather than guess.
+            continue
+        subject_name = subj_match.group(1).strip()
+        # Use the name as a synthetic code (no parenthesised number in this format)
+        code = subject_name.upper()
+
+        if code not in subjects:
+            subjects[code] = SubjectAnswers(
+                subject_code=code, subject_name=subject_name
+            )
+            subject_order.append(code)
+        subj = subjects[code]
+        subj.page_indices.append(page_idx)
+
+        # Tokenise the page line by line
+        lines = [ln.strip() for ln in page_text.splitlines() if ln.strip()]
+        # Walk pairs.
+        i = 0
+        while i < len(lines):
+            ln = lines[i]
+            qid_match = TEXTPDF_QID_RE.match(ln)
+            if qid_match and TEXTPDF_ANSWER_RE.match(lines[i + 1] if i + 1 < len(lines) else ""):
+                qid = qid_match.group(1)
+                ans = lines[i + 1]
+                entry = _classify_textpdf_answer(ans)
+                entry.question_id = qid
+                if qid in subj.entries:
+                    subj.duplicates.append((qid, subj.entries[qid].raw, entry.raw))
+                if entry.kind == "unknown":
+                    subj.unrecognised.append((qid, entry.raw))
+                subj.entries[qid] = entry
+                i += 2
+                continue
+            i += 1
+
+    total = sum(len(s.entries) for s in subjects.values())
+    for s in subjects.values():
+        if s.unrecognised:
+            warnings.append(
+                f"{s.subject_name}: {len(s.unrecognised)} unrecognised answer token(s)"
+            )
+        if s.duplicates:
+            warnings.append(
+                f"{s.subject_name}: {len(s.duplicates)} duplicate question id(s) overwritten"
+            )
+
+    return {
+        "subjects": subjects,
+        "subject_order": subject_order,
+        "total_entries": total,
+        "warnings": warnings,
+    }
+
+
+def looks_like_textpdf_key(doc: fitz.Document) -> bool:
+    """Quick sniff: are we looking at a CSIR text-PDF style key (no Subject:
+    (NNN) NAME headers, but has Subject: NAME trailers and 1-4 digit qids)?
+    """
+    sample = "\n".join(doc[i].get_text() for i in range(min(3, len(doc))))
+    # If the standard format detector matches, prefer that
+    if SUBJECT_RE.search(sample):
+        return False
+    # Else look for the textpdf signature
+    if TEXTPDF_SUBJECT_RE.search(sample):
+        # Make sure we have the column headers too
+        if "Correct Option ID" in sample:
+            return True
+    return False
+
+
 def _classify_answer(raw: str) -> AnswerEntry | None:
     s = raw.strip()
     if not s:
@@ -144,95 +277,106 @@ def parse_answer_key(pdf_path: str | Path) -> dict:
     """
     pdf_path = Path(pdf_path)
     doc = fitz.open(str(pdf_path))
+    try:
+        # CSIR text-PDF style keys have a different layout (no parenthesised
+        # subject codes; Option IDs instead of option numbers; multi-column
+        # tabular layout). Detect and dispatch.
+        if looks_like_textpdf_key(doc):
+            return _parse_textpdf_key(doc)
+
+        return _parse_standard_key(doc)
+    finally:
+        doc.close()
+
+
+def _parse_standard_key(doc: fitz.Document) -> dict:
+    """Parse the standard NTA/CSIR-UGC NET answer-key format."""
     subjects: dict[str, SubjectAnswers] = {}
     subject_order: list[str] = []
     warnings: list[str] = []
 
     current: SubjectAnswers | None = None
 
-    try:
-        for page_idx in range(len(doc)):
-            page_text = doc[page_idx].get_text()
+    for page_idx in range(len(doc)):
+        page_text = doc[page_idx].get_text()
 
-            # A page can carry over the previous subject. Look for a fresh subject header.
-            subj_match = SUBJECT_RE.search(page_text)
-            if subj_match:
-                code = subj_match.group(1).strip()
-                name = subj_match.group(2).strip(" ,;:-")
-                if code not in subjects:
-                    subjects[code] = SubjectAnswers(subject_code=code, subject_name=name)
-                    subject_order.append(code)
-                current = subjects[code]
-                current.page_indices.append(page_idx)
-            elif current is not None:
-                current.page_indices.append(page_idx)
+        # A page can carry over the previous subject. Look for a fresh subject header.
+        subj_match = SUBJECT_RE.search(page_text)
+        if subj_match:
+            code = subj_match.group(1).strip()
+            name = subj_match.group(2).strip(" ,;:-")
+            if code not in subjects:
+                subjects[code] = SubjectAnswers(subject_code=code, subject_name=name)
+                subject_order.append(code)
+            current = subjects[code]
+            current.page_indices.append(page_idx)
+        elif current is not None:
+            current.page_indices.append(page_idx)
 
-            if current is None:
-                # No subject yet — nothing to attach answers to.
+        if current is None:
+            # No subject yet — nothing to attach answers to.
+            continue
+
+        tokens = _tokenise(page_text)
+
+        # Walk tokens; pair every QID with the next answer-shaped token.
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            if _is_noise(tok):
+                i += 1
                 continue
-
-            tokens = _tokenise(page_text)
-
-            # Walk tokens; pair every QID with the next answer-shaped token.
-            i = 0
-            while i < len(tokens):
-                tok = tokens[i]
-                if _is_noise(tok):
+            if QID_RE.match(tok):
+                qid = tok
+                # Find next answer token that isn't noise
+                j = i + 1
+                answer_entry: AnswerEntry | None = None
+                while j < len(tokens):
+                    cand = tokens[j]
+                    if _is_noise(cand):
+                        j += 1
+                        continue
+                    # If the next token is itself another QID, the current one
+                    # has no answer paired with it -> protocol violation.
+                    if QID_RE.match(cand):
+                        break
+                    answer_entry = _classify_answer(cand)
+                    j += 1
+                    break
+                if answer_entry is None:
+                    current.unrecognised.append((qid, ""))
                     i += 1
                     continue
-                if QID_RE.match(tok):
-                    qid = tok
-                    # Find next answer token that isn't noise
-                    j = i + 1
-                    answer_entry: AnswerEntry | None = None
-                    while j < len(tokens):
-                        cand = tokens[j]
-                        if _is_noise(cand):
-                            j += 1
-                            continue
-                        # If the next token is itself another QID, the current one
-                        # has no answer paired with it -> protocol violation.
-                        if QID_RE.match(cand):
-                            break
-                        answer_entry = _classify_answer(cand)
-                        j += 1
-                        break
-                    if answer_entry is None:
-                        current.unrecognised.append((qid, ""))
-                        i += 1
-                        continue
-                    answer_entry.question_id = qid
-                    if qid in current.entries:
-                        prev = current.entries[qid].raw
-                        current.duplicates.append((qid, prev, answer_entry.raw))
-                    if answer_entry.kind == "unknown":
-                        current.unrecognised.append((qid, answer_entry.raw))
-                    current.entries[qid] = answer_entry
-                    i = j
-                    continue
-                i += 1
+                answer_entry.question_id = qid
+                if qid in current.entries:
+                    prev = current.entries[qid].raw
+                    current.duplicates.append((qid, prev, answer_entry.raw))
+                if answer_entry.kind == "unknown":
+                    current.unrecognised.append((qid, answer_entry.raw))
+                current.entries[qid] = answer_entry
+                i = j
+                continue
+            i += 1
 
-        total = sum(len(s.entries) for s in subjects.values())
-        for s in subjects.values():
-            if s.unrecognised:
-                warnings.append(
-                    f"Subject {s.subject_code} ({s.subject_name}): "
-                    f"{len(s.unrecognised)} unrecognised answer token(s)"
-                )
-            if s.duplicates:
-                warnings.append(
-                    f"Subject {s.subject_code}: "
-                    f"{len(s.duplicates)} duplicate question id(s) overwritten"
-                )
+    total = sum(len(s.entries) for s in subjects.values())
+    for s in subjects.values():
+        if s.unrecognised:
+            warnings.append(
+                f"Subject {s.subject_code} ({s.subject_name}): "
+                f"{len(s.unrecognised)} unrecognised answer token(s)"
+            )
+        if s.duplicates:
+            warnings.append(
+                f"Subject {s.subject_code}: "
+                f"{len(s.duplicates)} duplicate question id(s) overwritten"
+            )
 
-        return {
-            "subjects": subjects,
-            "subject_order": subject_order,
-            "total_entries": total,
-            "warnings": warnings,
-        }
-    finally:
-        doc.close()
+    return {
+        "subjects": subjects,
+        "subject_order": subject_order,
+        "total_entries": total,
+        "warnings": warnings,
+    }
 
 
 def match_subject_for_qids(
