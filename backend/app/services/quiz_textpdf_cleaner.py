@@ -108,6 +108,29 @@ def _strip_hindi(text: str) -> str:
     return "\n".join(out).strip()
 
 
+def _normalize_text(s: str) -> str:
+    """Tidy up the residue left after stripping Hindi:
+
+    - Collapse non-breaking spaces (U+00A0) into normal spaces
+    - Collapse runs of whitespace
+    - Fix the common '\xad' (soft hyphen) used by some PDFs as a word-break
+    - Trim
+    """
+    if not s:
+        return s
+    # U+00A0 non-breaking space -> normal space
+    s = s.replace("\u00a0", " ")
+    # U+00AD soft hyphen -> nothing (we already broke the word)
+    s = s.replace("\u00ad", "")
+    # U+200B-U+200F invisible / zero-width chars -> nothing
+    s = re.sub(r"[\u200b-\u200f\ufeff]", "", s)
+    # Collapse runs of internal whitespace into one space, preserving newlines
+    s = re.sub(r"[ \t]+", " ", s)
+    # Trim leading/trailing whitespace per line
+    s = "\n".join(line.strip() for line in s.splitlines())
+    return s.strip()
+
+
 # ---------------------------------------------------------------------------
 # Per-page extraction in reading order
 # ---------------------------------------------------------------------------
@@ -280,7 +303,7 @@ def _split_into_questions(spans: list[_Span]) -> list[_Question]:
         stem_clean = _QDESC_RE.sub("", stem_text_raw)
         # Strip stray [Option ID = N] (none should appear in stem normally)
         stem_clean = _OID_RE.sub("", stem_clean)
-        stem_clean = _strip_hindi(stem_clean.strip())
+        stem_clean = _normalize_text(_strip_hindi(stem_clean.strip()))
 
         # Options: walk the question's option region
         if opts_in_q:
@@ -348,6 +371,7 @@ def _parse_option_text(text: str) -> list[_Option]:
         cleaned = _strip_hindi(body_no_tag)
         # Collapse multiple internal newlines
         cleaned = re.sub(r"\n{2,}", "\n", cleaned).strip()
+        cleaned = _normalize_text(cleaned)
         options.append(_Option(number=num, text=cleaned, option_id=oid))
         idx += 2
     return options
@@ -391,6 +415,20 @@ def _measure_text_height(text: str, fontsize: float, max_width: float) -> float:
         if line:
             total += line_height
     return total
+
+
+def _estimate_options_height(options: list[_Option]) -> float:
+    """Approximate vertical space the options block will need.
+
+    Returns a generous estimate so the renderer can decide whether to
+    start a fresh page before placing a tall image.
+    """
+    if not options:
+        return 0.0
+    total = 0.0
+    for o in options:
+        total += _measure_text_height(f"{o.number}. {o.text}", fontsize=11, max_width=_AVAIL_W) + 4
+    return total + 10  # small buffer
 
 
 def _draw_wrapped_text(
@@ -539,6 +577,7 @@ def _render(
     out = fitz.open()
     matched: list[int] = []
     missing: list[tuple[int, str]] = []
+    hindi_imgs_removed = 0  # incremented when we drop a Hindi twin image
 
     # ---------- Cover ------------------------------------------------------
     cover = out.new_page(width=_PAGE_W, height=_PAGE_H)
@@ -593,8 +632,32 @@ def _render(
             y = _draw_wrapped_text(page, _MARGIN, y, _AVAIL_W, q.stem_text, fontsize=11)
             y += 10
 
-        # Diagrams (between stem and options visually preserves the source)
-        for img in q.images:
+        # Diagrams. In format 3 each "diagram-bearing" question typically has
+        # the same image rendered TWICE - English on top, Hindi version below.
+        # Drop the Hindi twin: keep only the topmost image when 2+ are
+        # present.
+        diagrams = list(q.images)
+        diagrams_dropped = 0
+        if len(diagrams) >= 2:
+            diagrams.sort(key=lambda im: (im.page_idx, round(im.bbox[1], 1)))
+            diagrams_dropped = len(diagrams) - 1
+            diagrams = [diagrams[0]]
+        hindi_imgs_removed += diagrams_dropped
+
+        # If the question has no stem text but does have a diagram, that
+        # means the actual question is rendered inside the image. Show a
+        # short hint so readers know to look at the image, not blame our
+        # cleaner.
+        if not q.stem_text and diagrams:
+            y = _draw_wrapped_text(
+                page, _MARGIN, y, _AVAIL_W,
+                "(question content is rendered as the image below)",
+                fontsize=10,
+                color=(0.55, 0.55, 0.55),
+            )
+            y += 8
+
+        for img in diagrams:
             try:
                 data = src.extract_image(img.xref)
             except Exception:
@@ -604,12 +667,15 @@ def _render(
                 continue
             iw = data.get("width") or img.width or 1
             ih = data.get("height") or img.height or 1
-            scale = min(1.0, _AVAIL_W / iw) if iw else 1.0
-            disp_w = iw * scale
-            disp_h = ih * scale
-            # Reserve room for answer box if attaching answers
-            reserve = 70 if answer_map is not None else 0
-            if y + disp_h > _PAGE_H - _MARGIN - reserve:
+
+            # Reserve room for answer box if attaching answers, plus
+            # an estimate of how much vertical room the options will need.
+            reserve = (70 if answer_map is not None else 0) + _estimate_options_height(q.options)
+
+            # If the current page does not have enough room left, start a
+            # fresh page first.
+            avail_h_here = _PAGE_H - _MARGIN - reserve - y
+            if avail_h_here < 80:
                 page = out.new_page(width=_PAGE_W, height=_PAGE_H)
                 y = _MARGIN
                 page.insert_text(
@@ -620,6 +686,14 @@ def _render(
                     color=(0.5, 0.5, 0.5),
                 )
                 y += 24
+                avail_h_here = _PAGE_H - _MARGIN - reserve - y
+
+            # Scale to fit BOTH width and height of the available space.
+            scale_w = _AVAIL_W / iw if iw else 1.0
+            scale_h = avail_h_here / ih if ih else 1.0
+            scale = min(1.0, scale_w, scale_h)
+            disp_w = iw * scale
+            disp_h = ih * scale
             rect = fitz.Rect(_MARGIN, y, _MARGIN + disp_w, y + disp_h)
             page.insert_image(rect, stream=img_bytes, keep_proportion=True)
             y += disp_h + 12
@@ -693,6 +767,7 @@ def _render(
     return {
         "answers_matched": len(matched),
         "answers_missing": [{"q_num": n, "q_id": qid} for n, qid in missing],
+        "hindi_imgs_removed": hindi_imgs_removed,
     }
 
 
@@ -744,7 +819,7 @@ def clean(
             "source_pages": len(src),
             "questions_detected": len(questions),
             "questions_kept": len(questions),
-            "translations_removed": 0,
+            "translations_removed": render_stats.get("hindi_imgs_removed", 0),
             "sections_detected": 0,
             "format": "textpdf",
             "answers_attached": answer_map is not None,
