@@ -27,6 +27,19 @@ import fitz  # PyMuPDF
 
 QUESTION_HEADER_RE = re.compile(r"Question\s+Number\s*:\s*(\d+)", re.IGNORECASE)
 QUESTION_ID_RE = re.compile(r"Question\s+Id\s*:\s*(\d+)", re.IGNORECASE)
+
+# --- Format 2: "PREVIEW QUESTION BANK(Dual)" / TCS internal preview ----------
+# Each question header is two adjacent text blocks:
+#   block N   : "Objective Question"
+#   block N+1 : "<sr_no>" or "<sr_no> <question_id>" or "<question_id>"
+# A single integer that is 5-7 digits long is treated as the question id.
+OBJECTIVE_HEADER_RE = re.compile(r"Objective\s+Question\b", re.IGNORECASE)
+QID_DIGIT_RE = re.compile(r"^(\d{5,7})$")
+SR_NO_RE = re.compile(r"^(\d{1,4})$")
+# Header text can be "1 703501" alone or "12 703512 2.0" with trailing marks.
+SR_AND_QID_RE = re.compile(r"^(\d{1,4})\s+(\d{5,7})(?:\s|$)")
+# Sometimes the qid arrives bundled with marks: "703512 2.0".
+QID_AND_MARKS_RE = re.compile(r"^(\d{5,7})\s+\d+(?:\.\d+)?\s*$")
 SECTION_HINTS = (
     "PART -",
     "PART-",
@@ -196,6 +209,105 @@ def _group_questions(blocks: Iterable[_Block]) -> tuple[list[_QuestionGroup], li
     return groups, section_headers
 
 
+def _group_questions_objective(
+    blocks: list[_Block],
+) -> tuple[list[_QuestionGroup], list[str]]:
+    """Format 2 grouping (PREVIEW QUESTION BANK / "Objective Question" header).
+
+    Each new question is signalled by a text block whose content matches
+    "Objective Question". The very next text block (skipping the column-marks
+    block on the right) carries the serial number and question id - either
+    in one block ("1 703501") or split across two blocks ("1" then "703501").
+    """
+    groups: list[_QuestionGroup] = []
+    section_headers: list[str] = []
+    current: _QuestionGroup | None = None
+    expecting_id = False  # True after we see "Objective Question"
+
+    # Bring everything into a flat list so we can peek backwards if needed.
+    bs = list(blocks)
+    i = 0
+    while i < len(bs):
+        block = bs[i]
+        if block.kind == "text":
+            text = block.text.strip()
+            if OBJECTIVE_HEADER_RE.search(text):
+                # Commit the previous question and start a new one
+                if current is not None:
+                    groups.append(current)
+                current = _QuestionGroup(q_num=len(groups) + 1, q_id="")
+                expecting_id = True
+                i += 1
+                continue
+
+            if expecting_id and current is not None:
+                # The header text might be "1 703501" in one block, or
+                # "12 703512 2.0" with marks appended, or split as "1" then
+                # later "703501". Look at this block first.
+                m = SR_AND_QID_RE.match(text)
+                if m:
+                    current.q_num = int(m.group(1))
+                    current.q_id = m.group(2)
+                    expecting_id = False
+                    i += 1
+                    continue
+                m = QID_AND_MARKS_RE.match(text)
+                if m:
+                    current.q_id = m.group(1)
+                    expecting_id = False
+                    i += 1
+                    continue
+                m = QID_DIGIT_RE.match(text)
+                if m:
+                    current.q_id = m.group(1)
+                    expecting_id = False
+                    i += 1
+                    continue
+                m = SR_NO_RE.match(text)
+                if m:
+                    # Save the serial number; keep waiting for the QID
+                    # in a later block.
+                    current.q_num = int(m.group(1))
+                    i += 1
+                    continue
+                # Anything else means we've drifted past the header strip;
+                # stop expecting an id.
+                expecting_id = False
+
+            # In format 2, lines like "A1", ":", "1", "2", "2.0" are all
+            # noise that lives on the page chrome - ignore them silently.
+        elif block.kind == "image":
+            if current is not None:
+                current.images.append(block)
+        i += 1
+
+    if current is not None:
+        groups.append(current)
+    return groups, section_headers
+
+
+def _detect_format(blocks: list[_Block]) -> str:
+    """Decide which question-paper format we're looking at.
+
+    Returns "ntaion" for the 2025 NTA / TCS-iON style with explicit
+    "Question Number : N Question Id : ..." lines, or "objective" for
+    the "PREVIEW QUESTION BANK" / "Objective Question" table style used
+    in some 2024 papers.
+    """
+    nta_hits = 0
+    obj_hits = 0
+    for b in blocks:
+        if b.kind != "text":
+            continue
+        if QUESTION_HEADER_RE.search(b.text):
+            nta_hits += 1
+        if OBJECTIVE_HEADER_RE.search(b.text):
+            obj_hits += 1
+        if nta_hits >= 3 or obj_hits >= 3:
+            break
+    return "objective" if obj_hits > nta_hits else "ntaion"
+
+
 def _dedupe_translations(groups: list[_QuestionGroup]) -> tuple[list[_QuestionGroup], int]:
     """Each question appears twice — English then Hindi. Keep the first."""
     seen: set[int] = set()
@@ -357,6 +469,10 @@ def _render_output_pdf(
 
     # --- Append missing-IDs report onto the cover --------------------------
     if answer_map is not None and missing:
+        # Re-fetch the cover page by index. PyMuPDF can invalidate the original
+        # page reference once many subsequent pages have been written to the
+        # same document.
+        cover = out[0]
         cover.insert_text(
             fitz.Point(MARGIN, PAGE_H - MARGIN - 200),
             f"Warning: {len(missing)} question(s) had no entry in the answer key",
@@ -425,6 +541,30 @@ def _draw_answer_box(page, margin: float, avail_w: float, text: str, found: bool
     )
 
 
+def _parse_quiz(blocks: list[_Block]) -> tuple[list[_QuestionGroup], list[str], int, str]:
+    """Detect the format and run the matching grouper.
+
+    Returns (kept_groups, section_headers, translations_removed, format_name).
+    For the "objective" format every question is unique, so there is nothing
+    to dedupe; translations_removed is 0.
+    """
+    fmt = _detect_format(blocks)
+    if fmt == "objective":
+        groups, section_headers = _group_questions_objective(blocks)
+        # No Hindi duplicates in this format - just drop empty groups.
+        kept = [g for g in groups if g.images]
+        dropped = 0
+        # Keep "kept" sequential numbering so answers stay aligned with q_ids.
+        for idx, g in enumerate(kept, start=1):
+            g.q_num = idx
+        return kept, section_headers, dropped, fmt
+
+    # Default: NTA / TCS-iON 2025 format with explicit "Question Number :" headers.
+    groups, section_headers = _group_questions(blocks)
+    kept, dropped = _dedupe_translations(groups)
+    return kept, section_headers, dropped, fmt
+
+
 def inspect_quiz_questions(input_path: str | Path) -> dict:
     """Lightweight pass over the quiz PDF that returns just the metadata needed
     for the preview step.
@@ -436,14 +576,14 @@ def inspect_quiz_questions(input_path: str | Path) -> dict:
     src = fitz.open(str(input_path))
     try:
         blocks = _extract_blocks(src)
-        groups, section_headers = _group_questions(blocks)
-        kept, dropped = _dedupe_translations(groups)
+        kept, section_headers, dropped, fmt = _parse_quiz(blocks)
         return {
             "source_pages": len(src),
             "question_ids": [g.q_id for g in kept if g.q_id],
             "questions_kept": len(kept),
             "translations_removed": dropped,
             "sections_detected": len(section_headers),
+            "format": fmt,
         }
     finally:
         src.close()
@@ -474,8 +614,7 @@ def clean_quiz_pdf(
     src = fitz.open(str(input_path))
     try:
         blocks = _extract_blocks(src)
-        groups, section_headers = _group_questions(blocks)
-        kept, dropped = _dedupe_translations(groups)
+        kept, section_headers, dropped, fmt = _parse_quiz(blocks)
         render_stats = _render_output_pdf(
             src, kept, section_headers, input_path.stem, output_path,
             answer_map=answer_map, answer_subject=answer_subject,
@@ -485,10 +624,11 @@ def clean_quiz_pdf(
             "input": str(input_path),
             "output": str(output_path),
             "source_pages": len(src),
-            "questions_detected": len(groups),
+            "questions_detected": len(kept),
             "questions_kept": len(kept),
             "translations_removed": dropped,
             "sections_detected": len(section_headers),
+            "format": fmt,
             "answers_attached": answer_map is not None,
             "answers_matched": render_stats["answers_matched"],
             "answers_missing": render_stats["answers_missing"],

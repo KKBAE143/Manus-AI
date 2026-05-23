@@ -36,8 +36,11 @@ import fitz
 # --- Patterns ---------------------------------------------------------------
 
 # Subject header. Captures the code in parens and the subject name.
+# Accepts both NTA formats:
+#   2025 final answer key: "Subject: (703) LIFE SCIENCES"
+#   2024 final answer key: "Subject : (703 ) Life Sciences"
 SUBJECT_RE = re.compile(
-    r"Subject\s*:\s*\(\s*(\d+)\s*\)\s*([A-Z][A-Z &,/\-]+?)(?:\s{2,}|\n|CSIR|FINAL|$)",
+    r"Subject\s*:\s*\(\s*(\d+)\s*\)\s*([A-Za-z][A-Za-z &,/\-]+?)(?:\s{2,}|\n|CSIR|FINAL|QUESTION\s*ID|$)",
     re.IGNORECASE,
 )
 
@@ -55,11 +58,16 @@ HEADER_NOISE = (
     "NATIONAL TESTING AGENCY",
     "Question ID",
     "Correct Option No.",
+    "CORRECT ANSWER",
+    "QUESTION ID",
     "Exam Date",
     "Exam Shift",
     "FINAL ANSWER KEY",
     "CSIR-UGC",
     "Page:",
+    "of 6",
+    "of 5",
+    "of 4",
 )
 
 
