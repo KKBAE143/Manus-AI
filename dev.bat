@@ -60,7 +60,7 @@ if "!KILLED_5000!"=="0" echo       nothing was listening on :5000
 :: so you can read the error. Close the window manually to stop.
 echo [3/3] Launching backend and frontend windows...
 
-start "Manuscript-API (port 8000)" cmd /k "cd /d %~dp0backend && set PYTHONPATH=.. && venv\Scripts\python.exe -m uvicorn app.main:app --host localhost --port 8000 --reload || echo. & echo [API EXITED] press any key to close. & pause >nul"
+start "Manuscript-API (port 8000)" cmd /k "cd /d %~dp0backend && set PYTHONPATH=.. && venv\Scripts\python.exe -m uvicorn app.main:app --host localhost --port 8000 --reload --reload-dir app || echo. & echo [API EXITED] press any key to close. & pause >nul"
 
 start "Manuscript-Web (port 5000)" cmd /k "cd /d %~dp0 && npm run dev || echo. & echo [WEB EXITED] press any key to close. & pause >nul"
 

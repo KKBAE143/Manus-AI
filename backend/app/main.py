@@ -191,4 +191,14 @@ else:
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
+    # reload_dirs limits the watcher to source files. Without this uvicorn
+    # would watch every file under backend/ including the storage volume,
+    # which causes the server to restart mid-upload (the new uploaded PDF
+    # looks like a "code change" to the watcher and kills the request).
+    uvicorn.run(
+        "app.main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        reload_dirs=["app"],
+    )

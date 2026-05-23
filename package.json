@@ -6,7 +6,7 @@
   "scripts": {
     "predev": "node -e \"const fs=require('fs');if(!fs.existsSync('.env'))fs.copyFileSync('.env.example','.env');\"",
     "dev": "vite --port=5000 --host=0.0.0.0",
-    "dev:backend": "cd backend && set PYTHONPATH=.. && venv\\Scripts\\python.exe -m uvicorn app.main:app --host localhost --port 8000 --reload",
+    "dev:backend": "cd backend && set PYTHONPATH=.. && venv\\Scripts\\python.exe -m uvicorn app.main:app --host localhost --port 8000 --reload --reload-dir app",
     "dev:all": "concurrently -n VITE,API -c cyan,magenta \"npm run dev\" \"npm run dev:backend\"",
     "build": "vite build",
     "preview": "vite preview",
