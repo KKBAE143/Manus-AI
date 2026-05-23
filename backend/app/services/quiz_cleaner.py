@@ -553,11 +553,24 @@ def _parse_quiz(blocks: list[_Block]) -> tuple[list[_QuestionGroup], list[str], 
         groups, section_headers = _group_questions_objective(blocks)
         # No Hindi duplicates in this format - just drop empty groups.
         kept = [g for g in groups if g.images]
-        dropped = 0
+        # In the "PREVIEW QUESTION BANK(Dual)" format each question is rendered
+        # as TWO stacked raster images: the English version on top, the Hindi
+        # translation directly below it. The question text + options + any
+        # diagram are baked INTO each image (the "A1: 1, A2: 2, ..." block at
+        # the right is just label glyphs, the real options are inside the
+        # raster). So for "Hindi-removed" output we keep just the FIRST image
+        # of each question and drop everything below it.
+        translations_removed = 0
+        for g in kept:
+            if len(g.images) >= 2:
+                # Sort by vertical position so "first" really means top-most.
+                g.images.sort(key=lambda im: (im.page_idx, round(im.bbox[1], 1)))
+                translations_removed += len(g.images) - 1
+                g.images = [g.images[0]]
         # Keep "kept" sequential numbering so answers stay aligned with q_ids.
         for idx, g in enumerate(kept, start=1):
             g.q_num = idx
-        return kept, section_headers, dropped, fmt
+        return kept, section_headers, translations_removed, fmt
 
     # Default: NTA / TCS-iON 2025 format with explicit "Question Number :" headers.
     groups, section_headers = _group_questions(blocks)
