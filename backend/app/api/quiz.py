@@ -42,7 +42,7 @@ from app.services.answer_key_parser import (
     match_subject_for_qids,
     parse_answer_key,
 )
-from app.services.quiz_cleaner import clean_quiz_pdf, inspect_quiz_questions
+from app.services.quiz_cleaner import clean_quiz_pdf, inspect_quiz_questions, UnsupportedFormatError
 from app.services import hf_storage_sync
 
 router = APIRouter(prefix="/api/v1/quiz", tags=["quiz"])
@@ -111,6 +111,9 @@ async def preview_quiz(
     # Inspect quiz to get question ids
     try:
         quiz_info = inspect_quiz_questions(quiz_path)
+    except UnsupportedFormatError as exc:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(status_code=415, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         shutil.rmtree(job_dir, ignore_errors=True)
         raise HTTPException(status_code=400, detail=f"Could not parse quiz PDF: {exc}") from exc

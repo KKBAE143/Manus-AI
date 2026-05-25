@@ -44,6 +44,32 @@ SUBJECT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Alternate 2023-style header used in some keys:
+#   "Subject :\nCHE - CHEMICAL SCIENCES"   (no parenthesised numeric code, just
+#                                            a 3-letter abbreviation)
+# We capture the abbreviation as the synthetic "code" and the full name.
+SUBJECT_ABBR_RE = re.compile(
+    r"Subject\s*:\s*\n?\s*([A-Z]{2,4})\s*[-\u2010\u2013\u2014]\s*([A-Z][A-Z &,/\-]+?)(?:\s{2,}|\n|$)",
+    re.IGNORECASE,
+)
+
+# 2022-style:
+#   "Subject :\n702 - CSIR Earth Atmospheric Ocean N Planetary Science"
+# Numeric code without parens, hyphen separator.
+SUBJECT_NUM_HYPHEN_RE = re.compile(
+    r"Subject\s*:\s*\n?\s*(\d{3})\s*[-\u2010\u2013\u2014]\s*([A-Za-z][A-Za-z0-9 &,/\-]+?)(?:\s{2,}|\n|$)",
+    re.IGNORECASE,
+)
+
+# Dec 2024-style:
+#   "Subject : Earth Science"
+# Just "Subject : <name>" with no abbreviation or number; the data IDs
+# themselves carry the subject prefix (702xxx, 703xxx, ...).
+SUBJECT_NAME_ONLY_RE = re.compile(
+    r"Subject\s*:\s*([A-Z][A-Za-z][A-Za-z &,/\-]+?)(?:\s{2,}|\n|$)",
+    re.IGNORECASE,
+)
+
 # A token that looks like a question id: standalone integer, 6+ digits.
 QID_RE = re.compile(r"^\d{6,}$")
 
@@ -87,6 +113,7 @@ class SubjectAnswers:
     page_indices: list[int] = field(default_factory=list)
     unrecognised: list[tuple[str, str]] = field(default_factory=list)
     duplicates: list[tuple[str, str, str]] = field(default_factory=list)  # (qid, prev_raw, new_raw)
+    use_short_id_mode: bool = False  # set True when matched via abbr/num-hyphen/name-only headers
 
 
 # --- CSIR text-PDF style key (used with the textpdf cleaner) ---------------
@@ -240,6 +267,49 @@ def _classify_answer(raw: str) -> AnswerEntry | None:
     return AnswerEntry(question_id="", raw=s, kind="unknown")
 
 
+def _classify_short_id_answer(raw: str) -> AnswerEntry | None:
+    """Classify an answer-cell value from the 2022-style "short id" key.
+
+    Allowed shapes:
+      "3"               -> single option-number style answer (1-4)
+      "503"             -> single Option ID
+      "501,504"         -> multiple Option IDs (multi-correct)
+      "501 or 503"      -> either Option ID accepted
+      "Dropped" / "Drop" -> question dropped
+      "*"               -> "Marks awarded to all who attempted the question"
+                           per the footnote on these keys; treat as Drop.
+    """
+    s = raw.strip()
+    if not s:
+        return None
+    # Bare asterisk = "marks awarded to all" per the key's footnote
+    if s in ("*", "(*)"):
+        return AnswerEntry(question_id="", raw="* (marks awarded to all)", kind="drop")
+    s = s.rstrip("*").strip()
+    if not s:
+        return AnswerEntry(question_id="", raw="* (marks awarded to all)", kind="drop")
+    if re.fullmatch(r"Dropped|Drop", s, re.IGNORECASE):
+        return AnswerEntry(question_id="", raw="Dropped", kind="drop")
+    # Single integer
+    if re.fullmatch(r"\d{1,5}", s):
+        return AnswerEntry(question_id="", raw=s, kind="single", options=[int(s)])
+    # Multi (comma-separated list of integers; tolerate trailing comma)
+    if re.fullmatch(r"\d{1,5}(?:\s*,\s*\d{1,5})+,?", s):
+        opts = sorted({int(p.strip()) for p in s.split(",") if p.strip().isdigit()})
+        return AnswerEntry(
+            question_id="",
+            raw=", ".join(str(x) for x in opts),
+            kind="multi",
+            options=opts,
+        )
+    # "X or Y"
+    if re.fullmatch(r"\d{1,5}\s+or\s+\d{1,5}", s, re.IGNORECASE):
+        nums = [int(x) for x in re.findall(r"\d+", s)]
+        return AnswerEntry(question_id="", raw=s, kind="or", options=nums)
+    # Anything else - flag for human review
+    return AnswerEntry(question_id="", raw=s, kind="unknown")
+
+
 def _is_noise(token: str) -> bool:
     upper = token.upper()
     return any(needle.upper() in upper for needle in HEADER_NOISE)
@@ -302,11 +372,56 @@ def _parse_standard_key(doc: fitz.Document) -> dict:
 
         # A page can carry over the previous subject. Look for a fresh subject header.
         subj_match = SUBJECT_RE.search(page_text)
+        abbr_match = None if subj_match else SUBJECT_ABBR_RE.search(page_text)
+        num_hyphen_match = None if (subj_match or abbr_match) else SUBJECT_NUM_HYPHEN_RE.search(page_text)
+        # Last-resort: bare "Subject : Name" with no code or abbreviation.
+        # We synthesize a code from the leading word(s) of the name. This
+        # path only fires when none of the more specific patterns matched.
+        name_only_match = (
+            None if (subj_match or abbr_match or num_hyphen_match)
+            else SUBJECT_NAME_ONLY_RE.search(page_text)
+        )
         if subj_match:
             code = subj_match.group(1).strip()
             name = subj_match.group(2).strip(" ,;:-")
             if code not in subjects:
                 subjects[code] = SubjectAnswers(subject_code=code, subject_name=name)
+                subject_order.append(code)
+            current = subjects[code]
+            current.page_indices.append(page_idx)
+        elif abbr_match:
+            # 2023-style "Subject :\nCHE - CHEMICAL SCIENCES" header. We use
+            # the abbreviation as the synthetic code so callers can group by
+            # subject; if the abbr already exists keep it, otherwise create.
+            abbr = abbr_match.group(1).strip().upper()
+            name = abbr_match.group(2).strip(" ,;:-")
+            if abbr not in subjects:
+                subjects[abbr] = SubjectAnswers(
+                    subject_code=abbr, subject_name=name, use_short_id_mode=True
+                )
+                subject_order.append(abbr)
+            current = subjects[abbr]
+            current.page_indices.append(page_idx)
+        elif num_hyphen_match:
+            # 2022-style "Subject :\n702 - CSIR Life Sciences" header.
+            code = num_hyphen_match.group(1).strip()
+            name = num_hyphen_match.group(2).strip(" ,;:-")
+            if code not in subjects:
+                subjects[code] = SubjectAnswers(
+                    subject_code=code, subject_name=name, use_short_id_mode=True
+                )
+                subject_order.append(code)
+            current = subjects[code]
+            current.page_indices.append(page_idx)
+        elif name_only_match:
+            # Dec 2024-style "Subject : Life Science" - synthesize a code
+            # from the name so callers can group consistently.
+            name = name_only_match.group(1).strip(" ,;:-")
+            code = name.upper().replace(" ", "_")
+            if code not in subjects:
+                subjects[code] = SubjectAnswers(
+                    subject_code=code, subject_name=name, use_short_id_mode=True
+                )
                 subject_order.append(code)
             current = subjects[code]
             current.page_indices.append(page_idx)
@@ -318,6 +433,86 @@ def _parse_standard_key(doc: fitz.Document) -> dict:
             continue
 
         tokens = _tokenise(page_text)
+
+        # Some keys (e.g. CSIR NET Nov 2020 / "8key.pdf") use Option ID values
+        # in the answer column where each answer ID is itself a 6+ digit
+        # number indistinguishable from a Question ID. The standard pair
+        # logic below would treat the answer as the next QID. Detect the
+        # column header and switch off the "next token must not be a QID"
+        # safety check.
+        answers_are_option_ids = (
+            "Correct Option ID" in page_text or "CORRECT OPTION ID" in page_text
+        )
+
+        # The "alternating pairs" mode is used for keys without parenthesised
+        # numeric subject codes (2022-style "702 - NAME" header, Dec 2024-style
+        # "Subject : NAME" header). Some of these keys mix small integers
+        # (1-20 for general-aptitude) with full 6-digit IDs (702101+ for
+        # subject-specific) on the SAME page, so we cannot rely on the
+        # 6-digit-ish QID_RE alone. The subject's `use_short_id_mode` flag
+        # tells us which parser to run.
+        is_short_id_mode = current.use_short_id_mode and (
+            "Correct" in page_text
+            and (
+                "Option ID" in page_text
+                or "OPTION ID" in page_text
+                or "Key" in page_text
+            )
+        )
+
+        if is_short_id_mode:
+            # Collect every integer token after the FIRST "Option ID" column
+            # header on the page (later mentions like the footer
+            # "Note :- Correct Option ID '*' means ..." must NOT be used as a
+            # marker because they would skip past all the data).
+            #
+            # We can't use _tokenise's joined-by-multispace splitter directly
+            # because the integers each sit on their own line; just walk the
+            # raw lines instead.
+            raw_lines = [ln.strip() for ln in page_text.splitlines() if ln.strip()]
+            # Find column-header marker (first occurrence ONLY)
+            header_idx = -1
+            for li, ln in enumerate(raw_lines):
+                # Skip lines that are clearly notes/footers.
+                if ln.lower().startswith(("note", "*", "(*)")):
+                    continue
+                if ln in (
+                    "Option ID", "OPTION ID",
+                    "Correct Option ID", "CORRECT OPTION ID",
+                    "Key", "KEY",
+                    "Correct Key", "CORRECT KEY",
+                ):
+                    header_idx = li
+                    break
+            data_lines = raw_lines[header_idx + 1:] if header_idx >= 0 else raw_lines
+            # Now walk in pairs: (qid_line, answer_line)
+            di = 0
+            while di + 1 < len(data_lines):
+                qid_str = data_lines[di]
+                ans_str = data_lines[di + 1]
+                # Skip section trailers ("NATIONAL TESTING AGENCY" etc.)
+                if _is_noise(qid_str) or _is_noise(ans_str):
+                    di += 1
+                    continue
+                # qid must be a small/medium integer (1-4 digits or 6-7 digits)
+                if not re.fullmatch(r"\d{1,7}", qid_str):
+                    di += 1
+                    continue
+                # answer can be: single int, "Dropped", "Multi" int list ("501,504"),
+                # or "1 or 2"-style.
+                ans_clean = ans_str.strip()
+                entry = _classify_short_id_answer(ans_clean)
+                if entry is None:
+                    di += 1
+                    continue
+                entry.question_id = qid_str
+                if qid_str in current.entries:
+                    current.duplicates.append((qid_str, current.entries[qid_str].raw, entry.raw))
+                if entry.kind == "unknown":
+                    current.unrecognised.append((qid_str, entry.raw))
+                current.entries[qid_str] = entry
+                di += 2
+            continue
 
         # Walk tokens; pair every QID with the next answer-shaped token.
         i = 0
@@ -336,9 +531,51 @@ def _parse_standard_key(doc: fitz.Document) -> dict:
                     if _is_noise(cand):
                         j += 1
                         continue
+
+                    # When answer column is Option ID, the cand may be a
+                    # bare big integer OR a big integer with trailing comma
+                    # (multi-correct continuation). Handle the comma case
+                    # FIRST so we don't fall through to the standard logic.
+                    if answers_are_option_ids and re.fullmatch(r"\d{6,},", cand):
+                        # Strip trailing comma and look ahead to collect
+                        # all comma-continued option ids.
+                        multi_opts = [int(cand.rstrip(","))]
+                        k = j + 1
+                        while k < len(tokens):
+                            nxt = tokens[k]
+                            if _is_noise(nxt):
+                                k += 1
+                                continue
+                            stripped = nxt.rstrip(",")
+                            if not re.fullmatch(r"\d{6,}", stripped):
+                                break
+                            multi_opts.append(int(stripped))
+                            k += 1
+                            if not nxt.endswith(","):
+                                break
+                        answer_entry = AnswerEntry(
+                            question_id="",
+                            raw=", ".join(str(o) for o in multi_opts),
+                            kind="multi",
+                            options=multi_opts,
+                        )
+                        j = k
+                        break
+
                     # If the next token is itself another QID, the current one
                     # has no answer paired with it -> protocol violation.
-                    if QID_RE.match(cand):
+                    # Exception: when the column header advertises "Correct
+                    # Option ID" the answer column ALSO contains big numbers
+                    # that match QID_RE; pair them anyway.
+                    if QID_RE.match(cand) and not answers_are_option_ids:
+                        break
+                    if answers_are_option_ids and QID_RE.match(cand):
+                        # Treat the option-id as a single big integer.
+                        answer_entry = AnswerEntry(
+                            question_id="", raw=cand, kind="single",
+                            options=[int(cand)],
+                        )
+                        j += 1
                         break
                     answer_entry = _classify_answer(cand)
                     j += 1

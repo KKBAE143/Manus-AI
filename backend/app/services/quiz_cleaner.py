@@ -40,6 +40,19 @@ SR_NO_RE = re.compile(r"^(\d{1,4})$")
 SR_AND_QID_RE = re.compile(r"^(\d{1,4})\s+(\d{5,7})(?:\s|$)")
 # Sometimes the qid arrives bundled with marks: "703512 2.0".
 QID_AND_MARKS_RE = re.compile(r"^(\d{5,7})\s+\d+(?:\.\d+)?\s*$")
+# Page chrome we want to skip while still expecting a question id (e.g. when
+# the "Objective Question" marker sits at the bottom of a page and the
+# numeric header is on the next page after a footer URL or page-break header).
+PAGE_CHROME_RE = re.compile(
+    r"^(file:///|https?://|"
+    r"\d{1,2}/\d{1,2}/\d{2,4}[,\s]|"      # date stamp like "3/3/25, 1:39 PM..."
+    r"3_Live_|"
+    r"PREVIEW\s+QUESTION\s+BANK|"
+    r"Module\s+Name\s*:|"
+    r"Exam\s+Date\s*:|"
+    r"Page\s+\d+\s*(of\s*\d+)?$)",
+    re.IGNORECASE,
+)
 SECTION_HINTS = (
     "PART -",
     "PART-",
@@ -241,6 +254,14 @@ def _group_questions_objective(
                 continue
 
             if expecting_id and current is not None:
+                # Page chrome (URLs, timestamps, watermark lines) sometimes
+                # appears between the "Objective Question" marker and the
+                # actual numeric header when the question spans a page
+                # boundary. Skip such lines without resetting expecting_id.
+                if PAGE_CHROME_RE.match(text):
+                    i += 1
+                    continue
+
                 # The header text might be "1 703501" in one block, or
                 # "12 703512 2.0" with marks appended, or split as "1" then
                 # later "703501". Look at this block first.
@@ -578,12 +599,41 @@ def _parse_quiz(blocks: list[_Block]) -> tuple[list[_QuestionGroup], list[str], 
     return kept, section_headers, dropped, fmt
 
 
+class UnsupportedFormatError(Exception):
+    """Raised when the question paper PDF cannot be parsed by any of our
+    cleaners (e.g. it is a scanned/image-only PDF with no selectable text).
+    The frontend surfaces the message to the user.
+    """
+
+
+def _looks_image_only(src: fitz.Document, sample_pages: int = 8) -> bool:
+    """True when the first few pages have no selectable text at all but
+    contain raster images. Used to refuse scanned PDFs early with a clear
+    error instead of producing an empty cleaned file.
+    """
+    n = min(sample_pages, len(src))
+    if n == 0:
+        return False
+    text_chars = 0
+    images = 0
+    for i in range(n):
+        text_chars += len(src[i].get_text())
+        images += len(src[i].get_images())
+    # If first 8 pages have ZERO text but any images at all, treat as scanned.
+    return text_chars == 0 and images > 0
+
+
 def inspect_quiz_questions(input_path: str | Path) -> dict:
     """Lightweight pass over the quiz PDF that returns just the metadata needed
     for the preview step.
 
     Does NOT render the output PDF — used so the user can confirm subject /
     matching before paying for the heavier render pass.
+
+    Raises UnsupportedFormatError when the PDF is a pure scan with no
+    selectable text. A scanned PDF needs OCR before our cleaner can do
+    anything reliable, and silently producing a wrong cleaned file would be
+    actively harmful for exam material.
     """
     input_path = Path(input_path)
 
@@ -591,6 +641,15 @@ def inspect_quiz_questions(input_path: str | Path) -> dict:
     # Detect it before opening the heavy block-extraction pipeline.
     src = fitz.open(str(input_path))
     try:
+        if _looks_image_only(src):
+            raise UnsupportedFormatError(
+                "This PDF appears to be a scan or image-only PDF with no "
+                "selectable text. Our cleaner needs the source PDF to "
+                "contain at least the question metadata or option markers "
+                "as text. Please upload the original text-based PDF, or "
+                "run OCR on the file first."
+            )
+
         from app.services import quiz_textpdf_cleaner
 
         if quiz_textpdf_cleaner.looks_like_textpdf_format(src):
@@ -636,6 +695,15 @@ def clean_quiz_pdf(
 
     src = fitz.open(str(input_path))
     try:
+        if _looks_image_only(src):
+            raise UnsupportedFormatError(
+                "This PDF appears to be a scan or image-only PDF with no "
+                "selectable text. Our cleaner needs the source PDF to "
+                "contain at least the question metadata or option markers "
+                "as text. Please upload the original text-based PDF, or "
+                "run OCR on the file first."
+            )
+
         from app.services import quiz_textpdf_cleaner
 
         if quiz_textpdf_cleaner.looks_like_textpdf_format(src):
