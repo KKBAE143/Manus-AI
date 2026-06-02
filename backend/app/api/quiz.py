@@ -62,7 +62,7 @@ def _safe_name(name: str) -> str:
 
 
 def _entry_to_payload(e: AnswerEntry) -> dict:
-    return {"text": format_answer_text(e), "kind": e.kind, "raw": e.raw}
+    return {"text": format_answer_text(e), "kind": e.kind, "raw": e.raw, "options": e.options}
 
 
 def _build_answer_map(subj: SubjectAnswers) -> dict[str, dict]:

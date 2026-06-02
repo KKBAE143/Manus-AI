@@ -27,6 +27,9 @@ import fitz  # PyMuPDF
 
 QUESTION_HEADER_RE = re.compile(r"Question\s+Number\s*:\s*(\d+)", re.IGNORECASE)
 QUESTION_ID_RE = re.compile(r"Question\s+Id\s*:\s*(\d+)", re.IGNORECASE)
+# In the ntaion format the option-id -> option-number mapping is printed in
+# the text as "Options :" followed by lines like "8024374761. 1".
+OPTION_ID_MAP_RE = re.compile(r"\b(\d{6,})\.\s*([1-9])\b")
 
 # --- Format 2: "PREVIEW QUESTION BANK(Dual)" / TCS internal preview ----------
 # Each question header is two adjacent text blocks:
@@ -108,6 +111,8 @@ class _QuestionGroup:
     q_num: int
     q_id: str = ""
     images: list[_Block] = field(default_factory=list)
+    # option_id (str) -> option number (1-4); populated for ntaion format
+    option_id_map: dict[str, int] = field(default_factory=dict)
 
 
 def _extract_blocks(doc: fitz.Document) -> list[_Block]:
@@ -206,6 +211,13 @@ def _group_questions(blocks: Iterable[_Block]) -> tuple[list[_QuestionGroup], li
                     q_id=qid_match.group(1) if qid_match else "",
                 )
                 continue
+            # Capture the option-id -> option-number mapping when present.
+            # The text "Options :" block holds lines like "8024374761. 1".
+            # We record it on the current question so the answer key (which
+            # references Option IDs) can be resolved to an option number.
+            if current is not None and "Option" in text:
+                for oid, num in OPTION_ID_MAP_RE.findall(text):
+                    current.option_id_map.setdefault(oid, int(num))
             # Pure metadata? Drop it entirely.
             if _is_pure_metadata(text):
                 continue
@@ -477,7 +489,8 @@ def _render_output_pdf(
             ans = answer_map.get(g.q_id) if g.q_id else None
             if ans:
                 matched.append(g.q_num)
-                _draw_answer_box(page, MARGIN, AVAIL_W, ans["text"], found=True)
+                ans_text = _resolve_option_id_answer(ans, g.option_id_map)
+                _draw_answer_box(page, MARGIN, AVAIL_W, ans_text, found=True)
             else:
                 missing.append((g.q_num, g.q_id or ""))
                 _draw_answer_box(
@@ -527,6 +540,44 @@ def _render_output_pdf(
         "answers_matched": len(matched),
         "answers_missing": [{"q_num": n, "q_id": qid} for n, qid in missing],
     }
+
+
+def _resolve_option_id_answer(ans: dict, option_id_map: dict[str, int]) -> str:
+    """Convert an Option-ID-based answer into "Correct Option: N".
+
+    Some keys (CSIR NET Nov 2020 style) give the correct answer as an
+    Option ID (e.g. 8024374762) instead of the option number (1-4). The
+    question paper text carries the Option-ID -> option-number mapping in
+    `option_id_map`. When we can resolve every option id in the answer we
+    rewrite the displayed text; otherwise we fall back to the original text
+    so we never hide information.
+    """
+    if not option_id_map:
+        return ans["text"]
+
+    kind = ans.get("kind")
+    options = ans.get("options") or []
+
+    # Only attempt resolution when the answer's option values look like
+    # Option IDs (big integers), i.e. they exist in the map.
+    resolved: list[int] = []
+    for opt in options:
+        num = option_id_map.get(str(opt))
+        if num is None:
+            # Not an Option ID we recognise - leave the answer untouched.
+            return ans["text"]
+        resolved.append(num)
+
+    if not resolved:
+        return ans["text"]
+
+    resolved = sorted(set(resolved))
+    if kind == "drop":
+        return ans["text"]
+    if len(resolved) == 1:
+        return f"Correct Option: {resolved[0]}"
+    label = "either accepted" if kind == "or" else "multiple correct"
+    return f"Correct Options: {', '.join(str(n) for n in resolved)}  ({label})"
 
 
 def _draw_answer_box(page, margin: float, avail_w: float, text: str, found: bool) -> None:

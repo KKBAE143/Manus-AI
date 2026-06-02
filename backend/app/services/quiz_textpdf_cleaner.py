@@ -108,6 +108,51 @@ def _strip_hindi(text: str) -> str:
     return "\n".join(out).strip()
 
 
+def _strip_leading_symbol_lines(s: str) -> str:
+    """Remove leading 'junk' lines from a stem before the real text begins.
+
+    Some text PDFs leak the previous question's superscript glyphs (e.g. a
+    lone degree sign ``°`` or a stray single digit from ``10²``) onto the top
+    of the following question's stem, rendering as::
+
+        °
+        °
+        A gas is heated ...
+
+    We strip ONLY leading lines that are clearly orphan glyphs:
+      * empty lines, or
+      * a single non-alphanumeric symbol (``°``, ``*``, ``•``, ``-`` ...), or
+      * a lone digit / very short digit run (1-2 chars) with no letters.
+
+    Scanning stops at the first line that contains an alphabetic character, so
+    real stem content is never touched. This is intentionally conservative
+    (best-effort): when in doubt about a line, we keep it.
+    """
+    if not s:
+        return s
+    lines = s.splitlines()
+    idx = 0
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            idx += 1
+            continue
+        # A line with any letter is real content -> stop stripping.
+        if any(ch.isalpha() for ch in stripped):
+            break
+        # Lone non-alphanumeric symbol (e.g. "°", "*", "•").
+        if len(stripped) == 1 and not stripped.isalnum():
+            idx += 1
+            continue
+        # Short orphan digit run (e.g. "2" leaked from a superscript).
+        if len(stripped) <= 2 and stripped.isdigit():
+            idx += 1
+            continue
+        # Anything else (could be meaningful) -> keep, stop scanning.
+        break
+    return "\n".join(lines[idx:]).strip()
+
+
 def _normalize_text(s: str) -> str:
     """Tidy up the residue left after stripping Hindi:
 
@@ -304,6 +349,10 @@ def _split_into_questions(spans: list[_Span]) -> list[_Question]:
         # Strip stray [Option ID = N] (none should appear in stem normally)
         stem_clean = _OID_RE.sub("", stem_clean)
         stem_clean = _normalize_text(_strip_hindi(stem_clean.strip()))
+        # Remove orphan leading glyphs (e.g. a degree sign or lone digit that
+        # leaked from the previous question's superscripts). Applied to the
+        # STEM ONLY so real trailing superscripts in options are preserved.
+        stem_clean = _strip_leading_symbol_lines(stem_clean)
 
         # Options: walk the question's option region
         if opts_in_q:
@@ -347,33 +396,46 @@ def _split_into_questions(spans: list[_Span]) -> list[_Question]:
 def _parse_option_text(text: str) -> list[_Option]:
     """Parse a chunk of text containing one question's options.
 
-    Each option starts with "1.", "2.", etc. on its own line, followed by
-    English text, then optionally Hindi text, then a "[Option ID = N]" tag.
+    Each option starts with "1.", "2.", etc. at the START OF A LINE, followed
+    by English text, then optionally Hindi text, then a "[Option ID = N]" tag.
+
+    Care is taken NOT to split on decimal numbers like "1.250" (which also
+    start a line as "1." followed by digits). A real option marker is a digit
+    1-4 followed by a dot and then a SPACE or non-digit, and the markers must
+    appear in increasing order.
     """
     options: list[_Option] = []
-    # Split on lines that are exactly "<digit>." optionally with whitespace.
-    chunks = re.split(r"(?m)^\s*([1-9])\s*\.\s*", text)
-    # chunks looks like ["", "1", "<text>", "2", "<text>", ...]
-    if len(chunks) < 3:
+    # An option marker: start-of-line, digit 1-4, optional spaces, a dot,
+    # then NOT immediately another digit (so "1.250" is not a marker).
+    marker_re = re.compile(r"(?m)^\s*([1-4])\s*\.(?!\d)\s*")
+
+    matches = list(marker_re.finditer(text))
+    if not matches:
         return options
-    idx = 1
-    while idx + 1 < len(chunks):
-        try:
-            num = int(chunks[idx])
-        except ValueError:
-            idx += 2
-            continue
-        body = chunks[idx + 1]
-        # Find the [Option ID = N] inside body
+
+    # Keep only markers that appear in increasing numeric order (1,2,3,4),
+    # which filters out stray "1." inside option bodies or trailing junk.
+    valid = []
+    expected = 1
+    for m in matches:
+        num = int(m.group(1))
+        if num == expected:
+            valid.append((num, m.start(), m.end()))
+            expected += 1
+        # allow the same expected number to be retried if a false hit slipped
+    if not valid:
+        return options
+
+    for i, (num, mstart, mend) in enumerate(valid):
+        body_end = valid[i + 1][1] if i + 1 < len(valid) else len(text)
+        body = text[mend:body_end]
         oid_match = _OID_RE.search(body)
         oid = oid_match.group(1) if oid_match else ""
         body_no_tag = _OID_RE.sub("", body).strip()
         cleaned = _strip_hindi(body_no_tag)
-        # Collapse multiple internal newlines
         cleaned = re.sub(r"\n{2,}", "\n", cleaned).strip()
         cleaned = _normalize_text(cleaned)
         options.append(_Option(number=num, text=cleaned, option_id=oid))
-        idx += 2
     return options
 
 
@@ -632,16 +694,52 @@ def _render(
             y = _draw_wrapped_text(page, _MARGIN, y, _AVAIL_W, q.stem_text, fontsize=11)
             y += 10
 
-        # Diagrams. In format 3 each "diagram-bearing" question typically has
-        # the same image rendered TWICE - English on top, Hindi version below.
-        # Drop the Hindi twin: keep only the topmost image when 2+ are
-        # present.
-        diagrams = list(q.images)
+        # Diagrams. Two cleanup steps:
+        #  1. Drop "junk" images: very thin separator lines and tiny inline
+        #     glyph images (degree symbols, math fragments) that carry no
+        #     question content. We keep only images with a meaningful area.
+        #  2. Drop the Hindi twin: in this format a diagram-bearing question
+        #     often renders the SAME image twice (English on top, Hindi
+        #     version directly below). When two similar-sized content images
+        #     remain we keep only the topmost (English) one.
         diagrams_dropped = 0
-        if len(diagrams) >= 2:
-            diagrams.sort(key=lambda im: (im.page_idx, round(im.bbox[1], 1)))
-            diagrams_dropped = len(diagrams) - 1
-            diagrams = [diagrams[0]]
+        content_imgs = []
+        for im in q.images:
+            w = im.width or 0
+            h = im.height or 0
+            # Skip separator lines (extremely wide-and-short or tall-and-thin)
+            if h <= 14 or w <= 14:
+                diagrams_dropped += 1
+                continue
+            # Skip tiny inline glyph images (e.g. 27x25 degree symbols)
+            if w < 60 and h < 60:
+                diagrams_dropped += 1
+                continue
+            content_imgs.append(im)
+
+        content_imgs.sort(key=lambda im: (im.page_idx, round(im.bbox[1], 1)))
+
+        # If 2+ real content images remain and they are similar in size,
+        # treat the lower one(s) as the Hindi twin and drop them.
+        if len(content_imgs) >= 2:
+            first = content_imgs[0]
+            kept_imgs = [first]
+            for other in content_imgs[1:]:
+                fw, fh = first.width or 1, first.height or 1
+                ow, oh = other.width or 1, other.height or 1
+                # "similar size" = within 35% on both dimensions
+                similar = (
+                    abs(fw - ow) <= 0.35 * max(fw, ow)
+                    and abs(fh - oh) <= 0.35 * max(fh, oh)
+                )
+                if similar:
+                    diagrams_dropped += 1  # Hindi twin
+                else:
+                    kept_imgs.append(other)  # genuinely different diagram
+            diagrams = kept_imgs
+        else:
+            diagrams = content_imgs
+
         hindi_imgs_removed += diagrams_dropped
 
         # If the question has no stem text but does have a diagram, that
