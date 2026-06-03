@@ -43,7 +43,7 @@ timeout /t 1 /nobreak >nul
 echo.
 echo [2/2] Launching backend and frontend windows...
 
-start "Manuscript-API (port 8000)" cmd /k "cd /d %~dp0backend && set PYTHONPATH=.. && venv\Scripts\python.exe -m uvicorn app.main:app --host localhost --port 8000 --reload --reload-dir app || echo. & echo [API EXITED] press any key to close. & pause >nul"
+start "Manuscript-API (port 8000)" cmd /k "cd /d %~dp0backend && set PYTHONPATH=.. && venv\Scripts\python.exe -m uvicorn app.main:app --host localhost --port 8000 || echo. & echo [API EXITED] press any key to close. & pause >nul"
 
 start "Manuscript-Web (port 5000)" cmd /k "cd /d %~dp0 && npm run dev || echo. & echo [WEB EXITED] press any key to close. & pause >nul"
 
@@ -57,6 +57,11 @@ echo   Quiz Cleaner page:   http://localhost:5000/quiz-cleaner
 echo.
 echo   Backend usually ready within 1-2 seconds.
 echo   The page auto-refreshes when the backend comes up.
+echo.
+echo   NOTE: backend runs WITHOUT auto-reload so it stays up while
+echo         in use. If you are editing backend code and want it to
+echo         restart on save, run instead:
+echo             npm run dev:backend:reload
 echo.
 echo   To stop everything: run dev-stop.bat
 echo ===============================================
