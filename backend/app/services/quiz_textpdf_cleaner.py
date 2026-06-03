@@ -109,48 +109,74 @@ def _strip_hindi(text: str) -> str:
 
 
 def _strip_leading_symbol_lines(s: str) -> str:
-    """Remove leading 'junk' lines from a stem before the real text begins.
+    """Remove orphan 'junk' lines around the real text of a stem.
 
-    Some text PDFs leak the previous question's superscript glyphs (e.g. a
-    lone degree sign ``°`` or a stray single digit from ``10²``) onto the top
-    of the following question's stem, rendering as::
+    Two kinds of leak happen in these text PDFs:
 
-        °
-        °
-        A gas is heated ...
+      * A lone degree sign / stray digit from the previous question's
+        superscripts lands at the TOP of the next stem::
 
-    We strip ONLY leading lines that are clearly orphan glyphs:
-      * empty lines, or
-      * a single non-alphanumeric symbol (``°``, ``*``, ``•``, ``-`` ...), or
-      * a lone digit / very short digit run (1-2 chars) with no letters.
+            °
+            °
+            A gas is heated ...
 
-    Scanning stops at the first line that contains an alphabetic character, so
-    real stem content is never touched. This is intentionally conservative
-    (best-effort): when in doubt about a line, we keep it.
+      * A stacked power tower (e.g. ``2^(2^2)``) emits its upper levels on
+        their own baselines, so a fragment like ``2^2`` ends up on a line of
+        its own ABOVE and BELOW the real sentence::
+
+            2^2
+            Which of the following values is same as 2^2 ?
+            2^2
+
+    We strip leading AND trailing lines that carry NO letters and are short
+    "symbol/math" fragments (digits, ``^``, operators, parentheses, a lone
+    symbol). Scanning stops as soon as a line containing a letter is reached,
+    so the real stem text is never touched. If the stem has NO letter line at
+    all (a pure-math stem) we leave it untouched so nothing is ever lost.
+    Intentionally conservative: when unsure about a line, keep it.
     """
     if not s:
         return s
     lines = s.splitlines()
-    idx = 0
-    for line in lines:
-        stripped = line.strip()
+    if not any(any(ch.isalpha() for ch in ln) for ln in lines):
+        # No alphabetic anchor anywhere - don't risk deleting real content.
+        return s
+
+    def _is_orphan(stripped: str) -> bool:
         if not stripped:
-            idx += 1
-            continue
-        # A line with any letter is real content -> stop stripping.
+            return True
         if any(ch.isalpha() for ch in stripped):
-            break
+            return False
         # Lone non-alphanumeric symbol (e.g. "°", "*", "•").
         if len(stripped) == 1 and not stripped.isalnum():
-            idx += 1
-            continue
-        # Short orphan digit run (e.g. "2" leaked from a superscript).
-        if len(stripped) <= 2 and stripped.isdigit():
-            idx += 1
-            continue
-        # Anything else (could be meaningful) -> keep, stop scanning.
-        break
-    return "\n".join(lines[idx:]).strip()
+            return True
+        # Short math/symbol fragment with no letters: digits, ^, operators,
+        # parentheses, slashes, dots, commas. Keep it short to stay safe.
+        if len(stripped) <= 6 and re.fullmatch(r"[0-9^()<>=+\-*/.,\u2010\s]+", stripped):
+            return True
+        return False
+
+    start = 0
+    while start < len(lines):
+        stripped = lines[start].strip()
+        if any(ch.isalpha() for ch in stripped):
+            break
+        if _is_orphan(stripped):
+            start += 1
+        else:
+            break
+
+    end = len(lines)
+    while end > start:
+        stripped = lines[end - 1].strip()
+        if any(ch.isalpha() for ch in stripped):
+            break
+        if _is_orphan(stripped):
+            end -= 1
+        else:
+            break
+
+    return "\n".join(lines[start:end]).strip()
 
 
 def _normalize_text(s: str) -> str:
@@ -192,6 +218,146 @@ class _Span:
     height: int = 0
 
 
+def _reflow_page_text(blocks: list[dict]) -> list[tuple[tuple, str]]:
+    """Rebuild page text, re-attaching sub/superscript glyphs inline.
+
+    PyMuPDF emits sub/superscript digits (the ``1 2 3`` of ``A1 A2 A3`` or the
+    ``2`` of ``10^2``) as small-font spans, often in their OWN block on a
+    slightly shifted baseline. Joined naively they drop onto separate lines and
+    produce garbage like::
+
+        A < A < A
+        1
+        2
+        3
+
+    Strategy (page-wide so it works even when the digits are in a different
+    block than their base text):
+
+      1. Collect every text span with geometry (x range, baseline, font size).
+      2. ``body_size`` = the most common font size on the page. A span whose
+         size is clearly smaller (< 85% of body) and whose text is short
+         (<= 4 chars) is treated as a sub/superscript "script" glyph.
+      3. Attach each script glyph to the nearest BASE span that sits on the
+         same baseline and just to its left, concatenated with no space so
+         ``A`` + ``1`` -> ``A1``.
+      4. Rebuild each block's text from its base spans (rows clustered by
+         baseline, ordered left-to-right) with the attached scripts inlined.
+
+    Returns a list of ``(block_bbox, text)`` in original block order.
+    """
+    # --- 1. collect spans -------------------------------------------------
+    all_spans: list[dict] = []
+    sizes: list[float] = []
+    for bi, b in enumerate(blocks):
+        for ln in b.get("lines", []):
+            for s in ln.get("spans", []):
+                txt = s.get("text", "")
+                if txt == "":
+                    continue
+                bbox = s.get("bbox", (0.0, 0.0, 0.0, 0.0))
+                org = s.get("origin", (0.0, 0.0))
+                rec = {
+                    "block": bi,
+                    "text": txt,
+                    "x0": float(bbox[0]),
+                    "x1": float(bbox[2]),
+                    "baseline": float(org[1]),
+                    "size": float(s.get("size", 0.0) or 0.0),
+                }
+                all_spans.append(rec)
+                if txt.strip():
+                    sizes.append(rec["size"])
+
+    if not all_spans:
+        return []
+
+    body_size = max(set(sizes), key=sizes.count) if sizes else 0.0
+    line_tol = max(body_size * 0.6, 4.0)
+
+    def _is_script(s: dict) -> bool:
+        if body_size <= 0:
+            return False
+        t = s["text"].strip()
+        if not t:
+            return False
+        return s["size"] < body_size * 0.85 and len(t) <= 4
+
+    base_spans = [s for s in all_spans if not _is_script(s)]
+    script_spans = [s for s in all_spans if _is_script(s)]
+
+    # --- 3. attach scripts to the base span immediately to their left -----
+    attach: dict[int, list[dict]] = {id(b): [] for b in base_spans}
+    for sc in script_spans:
+        best: dict | None = None
+        for b in base_spans:
+            if abs(b["baseline"] - sc["baseline"]) > line_tol:
+                continue
+            # base must begin at or to the left of the script glyph
+            if b["x0"] <= sc["x0"] + 1.0:
+                if best is None or b["x0"] > best["x0"]:
+                    best = b  # rightmost base still left of the script
+        if best is not None:
+            # Decide super vs subscript by comparing baselines. A superscript
+            # sits ABOVE the base (smaller y); a subscript sits BELOW (larger
+            # y). Superscripts are exponents -> mark with "^" so "2" + "6"
+            # renders as "2^6", never the ambiguous "26". Subscripts (e.g. the
+            # "1" in "A1") read fine attached directly.
+            sc["is_super"] = sc["baseline"] < best["baseline"] - 0.5
+            attach[id(best)].append(sc)
+        else:
+            # No base to the left on this baseline: treat as a normal base span
+            # so the glyph is never silently lost (exam accuracy matters).
+            base_spans.append(sc)
+            attach[id(sc)] = []
+
+    # --- 4. rebuild per-block text ---------------------------------------
+    block_bases: dict[int, list[dict]] = {}
+    for b in base_spans:
+        block_bases.setdefault(b["block"], []).append(b)
+
+    out: list[tuple[tuple, str]] = []
+    for bi, b in enumerate(blocks):
+        bases = block_bases.get(bi)
+        if not bases:
+            continue
+        rows: list[dict] = []
+        for sp in sorted(bases, key=lambda s: (round(s["baseline"], 1), s["x0"])):
+            placed = False
+            for row in rows:
+                if abs(sp["baseline"] - row["baseline"]) <= line_tol:
+                    row["items"].append(sp)
+                    placed = True
+                    break
+            if not placed:
+                rows.append({"baseline": sp["baseline"], "items": [sp]})
+        rows.sort(key=lambda r: r["baseline"])
+
+        out_lines: list[str] = []
+        for row in rows:
+            parts = sorted(row["items"], key=lambda s: s["x0"])
+            buf = ""
+            for sp in parts:
+                buf += sp["text"]
+                for sc in sorted(attach.get(id(sp), []), key=lambda s: s["x0"]):
+                    glyph = sc["text"].strip()
+                    if sc.get("is_super") and any(ch.isalnum() for ch in glyph):
+                        # Real exponent (digits/letters): use caret so
+                        # "2"+"6" -> "2^6", never the ambiguous "26".
+                        buf = buf.rstrip() + "^" + glyph
+                    else:
+                        # Subscript ("A"+"1" -> "A1") or a superscript SYMBOL
+                        # such as a degree sign ("2.5"+"°" -> "2.5°"): attach
+                        # directly without a caret.
+                        buf = buf.rstrip() + glyph
+            if buf.strip():
+                out_lines.append(buf)
+        joined = "\n".join(out_lines).strip()
+        if joined:
+            out.append((tuple(b["bbox"]), joined))
+    return out
+
+
 def _flatten_pages(doc: fitz.Document) -> list[_Span]:
     """Return every text block + image in reading order across all pages.
 
@@ -203,25 +369,13 @@ def _flatten_pages(doc: fitz.Document) -> list[_Span]:
         page = doc[pi]
         page_spans: list[_Span] = []
 
-        # text blocks
-        for b in page.get_text("dict").get("blocks", []):
-            if b.get("type", 0) != 0:
-                continue
-            joined = []
-            for line in b.get("lines", []):
-                line_text = "".join(s.get("text", "") for s in line.get("spans", []))
-                if line_text:
-                    joined.append(line_text)
-            joined_text = "\n".join(joined).strip()
-            if not joined_text:
-                continue
-            page_spans.append(
-                _Span(
-                    page_idx=pi,
-                    bbox=tuple(b["bbox"]),
-                    text=joined_text,
-                )
-            )
+        # text blocks (with sub/superscript glyphs re-attached inline)
+        text_blocks = [
+            b for b in page.get_text("dict").get("blocks", [])
+            if b.get("type", 0) == 0
+        ]
+        for bbox, text in _reflow_page_text(text_blocks):
+            page_spans.append(_Span(page_idx=pi, bbox=bbox, text=text))
 
         # images
         for info in page.get_image_info(xrefs=True):
@@ -694,17 +848,29 @@ def _render(
             y = _draw_wrapped_text(page, _MARGIN, y, _AVAIL_W, q.stem_text, fontsize=11)
             y += 10
 
-        # Diagrams. Two cleanup steps:
+        # Diagrams. Cleanup steps:
+        #  0. De-duplicate by xref. A tall diagram that straddles a page break
+        #     is reported once per page it touches, so the SAME xref can appear
+        #     2+ times for one question. That is one image, not a twin.
         #  1. Drop "junk" images: very thin separator lines and tiny inline
         #     glyph images (degree symbols, math fragments) that carry no
         #     question content. We keep only images with a meaningful area.
         #  2. Drop the Hindi twin: in this format a diagram-bearing question
-        #     often renders the SAME image twice (English on top, Hindi
-        #     version directly below). When two similar-sized content images
-        #     remain we keep only the topmost (English) one.
+        #     often renders the SAME diagram twice (English on top, Hindi
+        #     version directly below) as DIFFERENT xrefs. When two similar-sized
+        #     content images remain we keep only the topmost (English) one.
         diagrams_dropped = 0
+        # Step 0: collapse repeated xrefs, keeping the first (top-most) anchor.
+        seen_xrefs: set[int] = set()
+        deduped: list[_Span] = []
+        for im in sorted(q.images, key=lambda im: (im.page_idx, round(im.bbox[1], 1))):
+            if im.xref and im.xref in seen_xrefs:
+                continue
+            seen_xrefs.add(im.xref)
+            deduped.append(im)
+
         content_imgs = []
-        for im in q.images:
+        for im in deduped:
             w = im.width or 0
             h = im.height or 0
             # Skip separator lines (extremely wide-and-short or tall-and-thin)

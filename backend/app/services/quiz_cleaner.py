@@ -30,6 +30,15 @@ QUESTION_ID_RE = re.compile(r"Question\s+Id\s*:\s*(\d+)", re.IGNORECASE)
 # In the ntaion format the option-id -> option-number mapping is printed in
 # the text as "Options :" followed by lines like "8024374761. 1".
 OPTION_ID_MAP_RE = re.compile(r"\b(\d{6,})\.\s*([1-9])\b")
+# A second ntaion variant (e.g. 8qb2) lists option IDs as bare, NUMBERLESS
+# lines after an "Options :" marker, one per block, in display order:
+#     Options :
+#     8024373601.
+#     8024373602.
+#     ...
+# Here the option NUMBER is implied by appearance order (1st = option 1).
+OPTIONS_MARKER_RE = re.compile(r"^\s*Options\s*:\s*$", re.IGNORECASE)
+BARE_OPTION_ID_RE = re.compile(r"^\s*(\d{6,})\.\s*$")
 
 # --- Format 2: "PREVIEW QUESTION BANK(Dual)" / TCS internal preview ----------
 # Each question header is two adjacent text blocks:
@@ -104,6 +113,10 @@ class _Block:
     xref: int = 0
     width: int = 0
     height: int = 0
+    # For the split-image ntaion variant (8qb2): when an image is an option
+    # body rendered as its own picture, this holds its option number (1..4).
+    # 0 means "not an option image" (e.g. the question stem image).
+    option_number: int = 0
 
 
 @dataclass
@@ -197,6 +210,11 @@ def _group_questions(blocks: Iterable[_Block]) -> tuple[list[_QuestionGroup], li
     groups: list[_QuestionGroup] = []
     section_headers: list[str] = []
     current: _QuestionGroup | None = None
+    # For the numberless ntaion variant: once we hit an "Options :" marker we
+    # collect the bare option-id lines that follow in display order. This
+    # counter is the next option number to assign (1..4); 0 means "not
+    # currently collecting".
+    bare_opt_next = 0
 
     for block in blocks:
         if block.kind == "text":
@@ -210,14 +228,34 @@ def _group_questions(blocks: Iterable[_Block]) -> tuple[list[_QuestionGroup], li
                     q_num=int(qmatch.group(1)),
                     q_id=qid_match.group(1) if qid_match else "",
                 )
+                bare_opt_next = 0
                 continue
             # Capture the option-id -> option-number mapping when present.
-            # The text "Options :" block holds lines like "8024374761. 1".
-            # We record it on the current question so the answer key (which
-            # references Option IDs) can be resolved to an option number.
+            # Variant A (8qb): the "Options :" block holds lines like
+            #   "8024374761. 1 8024374762. 2 ...". We record it on the
+            # current question so the answer key (which references Option IDs)
+            # can be resolved to an option number.
             if current is not None and "Option" in text:
+                found_explicit = False
                 for oid, num in OPTION_ID_MAP_RE.findall(text):
                     current.option_id_map.setdefault(oid, int(num))
+                    found_explicit = True
+                # Variant B (8qb2): a bare "Options :" marker with no numbers.
+                # Start collecting the bare option-id lines that follow.
+                if not found_explicit and OPTIONS_MARKER_RE.match(text.strip()):
+                    bare_opt_next = 1
+            elif current is not None and bare_opt_next:
+                # Inside a numberless options region: each bare "<id>." block is
+                # the next option in order. Stop after 4 (a normal MCQ).
+                m = BARE_OPTION_ID_RE.match(text.strip())
+                if m:
+                    current.option_id_map.setdefault(m.group(1), bare_opt_next)
+                    # The option's content image was emitted immediately before
+                    # this bare-id text block, so tag the most recent image with
+                    # its option number so the renderer can draw a "1." label.
+                    if current.images and current.images[-1].option_number == 0:
+                        current.images[-1].option_number = bare_opt_next
+                    bare_opt_next = bare_opt_next + 1 if bare_opt_next < 4 else 0
             # Pure metadata? Drop it entirely.
             if _is_pure_metadata(text):
                 continue
@@ -467,6 +505,10 @@ def _render_output_pdf(
             scale = min(1.0, AVAIL_W / iw) if iw else 1.0
             disp_w = iw * scale
             disp_h = ih * scale
+            # For the split-image variant the option number is not baked into
+            # the picture, so we draw a "1." / "2." label to the left of it.
+            label = f"{img.option_number}." if img.option_number else ""
+            label_w = 22.0 if label else 0.0
             # Reserve space for the answer box (about 60pt) when an answer is expected
             reserve = 70 if answer_map is not None else 0
             if y + disp_h > PAGE_H - MARGIN - reserve:
@@ -480,7 +522,23 @@ def _render_output_pdf(
                     color=(0.5, 0.5, 0.5),
                 )
                 y += 24
-            rect = fitz.Rect(MARGIN, y, MARGIN + disp_w, y + disp_h)
+            if label:
+                # Vertically center the label against the option image.
+                page.insert_text(
+                    fitz.Point(MARGIN, y + min(disp_h / 2 + 4, 18)),
+                    label,
+                    fontsize=12,
+                    fontname="hebo",
+                    color=(0.13, 0.13, 0.13),
+                )
+            img_x = MARGIN + label_w
+            avail_for_img = AVAIL_W - label_w
+            if disp_w > avail_for_img:
+                # Re-scale so the labelled option image still fits the margin.
+                rescale = avail_for_img / disp_w
+                disp_w *= rescale
+                disp_h *= rescale
+            rect = fitz.Rect(img_x, y, img_x + disp_w, y + disp_h)
             page.insert_image(rect, stream=img_bytes, keep_proportion=True)
             y += disp_h + 14
 
